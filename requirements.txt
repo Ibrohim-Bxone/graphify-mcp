@@ -1,0 +1,9 @@
+mcp>=1.2.0
+chromadb>=0.5.0
+flask>=2.3.0
+numpy>=1.24.0
+
+# Optional — only needed if you switch the embedder in the dashboard's "Modellar" tab.
+# The default local embedder needs none of these; imports are lazy in embedders.py.
+# openai>=1.0.0     # OpenAI Embeddings backend
+# requests>=2.28.0  # Ollama / custom API backends (often already pulled in transitively)

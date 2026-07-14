@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Personal data — this is a local knowledge base, never publish real content
+kg_db/
+token_stats.json
+models_config.json
+
+# Logs
+*.log
+
+# Old packaging artifacts (superseded by the root-level installer)
+dist/
+graphify-installer.zip
+
+# Artifacts from the unrelated Graphify-Labs/graphify code-graph CLI tool
+# (different project, same name — was tested inside this folder)
+graphify-out/
+CLAUDE.md
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
