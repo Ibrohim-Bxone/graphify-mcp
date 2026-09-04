@@ -6,8 +6,10 @@ o'zgarishidan aniqlanadi (diskni ortiqcha yuklamaslik uchun TTL bilan keshlangan
 """
 
 import functools
+import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import time
 
@@ -115,6 +117,105 @@ def notify_write() -> None:
     _last_check_time = time.monotonic()
 
 
+def get_segment_seq_ids() -> tuple:
+    """SQLite dan METADATA va VECTOR segmentlarining hozirgi max seq_id larini qaytaradi."""
+    sqlite_file = Path(DB_PATH) / "chroma.sqlite3"
+    if not sqlite_file.exists():
+        return None, None
+    try:
+        conn = sqlite3.connect(str(sqlite_file), timeout=5.0)
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT s.scope, m.seq_id
+                FROM segments s
+                JOIN collections c ON s.collection = c.id
+                JOIN max_seq_id m ON s.id = m.segment_id
+                WHERE s.scope IN ('METADATA', 'VECTOR') AND c.name = ?
+            """, (COLLECTION,))
+            rows = dict(cur.fetchall())
+            return rows.get("METADATA"), rows.get("VECTOR")
+        finally:
+            conn.close()
+    except Exception:
+        return None, None
+
+
+def get_sync_threshold() -> int:
+    """Kolleksiyaning sync_threshold parametrini qaytaradi (sukut bo'yicha 1000)."""
+    sqlite_file = Path(DB_PATH) / "chroma.sqlite3"
+    if not sqlite_file.exists():
+        return 1000
+    try:
+        conn = sqlite3.connect(str(sqlite_file), timeout=5.0)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT config_json_str FROM collections WHERE name = ?",
+                (COLLECTION,),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                cfg = json.loads(row[0])
+                threshold = (
+                    cfg.get("keys", {})
+                    .get("#embedding", {})
+                    .get("float_list", {})
+                    .get("vector_index", {})
+                    .get("config", {})
+                    .get("hnsw", {})
+                    .get("sync_threshold")
+                )
+                if threshold is not None:
+                    return int(threshold)
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return 1000
+
+
+def flush_index(target_col=None) -> bool:
+    """Agar metadata segmenti bilan vektor segmenti o'rtasida farq bo'lsa (yangi yozuvlar diskka tushmagan),
+    chegarani kesib o'tish uchun mavjud yozuvlarni aynan o'z mazmuni va embeddinglari bilan
+    upsert qilib, HNSW indeksining diskka (header.bin) to'liq yozilishini kafolatlaydi.
+
+    Farq bo'lmasa (meta_seq <= vec_seq) — hech qanday upsert qilmaydi (0 ta ortiqcha amal).
+    """
+    meta_seq, vec_seq = get_segment_seq_ids()
+    if meta_seq is None or vec_seq is None:
+        return False
+
+    if meta_seq <= vec_seq:
+        return True
+
+    if target_col is None:
+        target_col = _col
+        if target_col is None:
+            target_col = get_collection()
+    if target_col is None or target_col.count() == 0:
+        return False
+
+    sync_threshold = get_sync_threshold()
+    target_seq = vec_seq + sync_threshold
+    needed = max(1, target_seq - meta_seq)
+
+    pool = target_col.get(limit=needed, include=["documents", "metadatas", "embeddings"])
+    ids = pool.get("ids", [])
+    if not ids:
+        return False
+
+    target_col.upsert(
+        ids=ids,
+        documents=pool.get("documents") if pool.get("documents") is not None else None,
+        metadatas=pool.get("metadatas") if pool.get("metadatas") is not None else None,
+        embeddings=pool.get("embeddings") if pool.get("embeddings") is not None else None,
+    )
+
+    notify_write()
+    return True
+
+
 def get_collection():
     """Hozirgi yangilangan kolleksiyani qaytaradi. Eskirgan bo'lsa avtomatik yangilaydi."""
     check_cache_freshness()
@@ -162,6 +263,8 @@ class CollectionProxy:
     """Har bir operatsiyadan oldin kesh yangiligini tekshirib, joriy kolleksiyaga yo'naltiruvchi proksi."""
 
     def __getattr__(self, name):
+        if name == "flush_index":
+            return flush_index
         check_cache_freshness()
         attr = getattr(_col, name)
         if callable(attr):

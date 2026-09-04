@@ -13,7 +13,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 import chromadb
+from db import flush_index
 
 DB_PATH = str(Path(__file__).parent / "kg_db")
 COLLECTION = "graphify"
@@ -94,6 +98,9 @@ def main():
             total_chunks += len(ids)
             total_files += 1
             print(f"indexed: {f} ({len(ids)} chunks)")
+
+    if total_chunks > 0:
+        flush_index(col)
 
     print(f"\nDone. {total_files} files, {total_chunks} chunks. DB now holds {col.count()} chunks total.")
 

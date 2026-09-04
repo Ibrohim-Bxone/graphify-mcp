@@ -28,6 +28,7 @@ from db import (
     reopen as db_reopen,
     db_retry,
     _open_collection as db_open_collection,
+    flush_index,
 )
 # Running cumulative token-savings ESTIMATE (see search_knowledge/save_memory
 # below). Kept as a small JSON file next to kg_db/ rather than in Chroma's
@@ -143,7 +144,7 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
 
     Args:
         query: what to look for, in natural language (any language).
-        top_k: number of results to return (1-10).
+        top_k: number of results to return (1-30).
         kind: optional filter: "decision", "summary", "note", "prompt" or "doc".
         project: which project to search. Default "current" = this project PLUS the
             always-open projects (ALWAYS_OPEN, default "shared" and "Promtlarim";
@@ -158,7 +159,9 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
         Matched entries formatted with kind, title, project, source, date, author (if available),
         similarity score, and snippet.
     """
-    top_k = max(1, min(int(top_k), 10))
+    # Yuqori chegara 30 ga ko'tarildi (2026-09-04 e'tirozi: 10 ta cheklov 10 dan ortiq mos yozuv bo'lganda natijalarni kesib qo'yardi).
+    # Sukut qiymati 5 bo'lib qoladi (har bir so'rovda ortiqcha token sarflanishining oldini olish uchun).
+    top_k = max(1, min(int(top_k), 30))
     filters = []
     if kind:
         filters.append({"kind": kind})
@@ -243,6 +246,10 @@ def save_memory(content: str, title: str, kind: str = "note", tags: str = "",
             "est_tokens": _est_tokens(content),
         }],
     )
+    try:
+        flush_index()
+    except Exception:
+        pass
     return f"Saved as {mem_id} ({kind}: {title}, project: {project})"
 
 
