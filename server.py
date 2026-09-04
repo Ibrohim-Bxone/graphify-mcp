@@ -36,7 +36,14 @@ from db import (
 STATS_PATH = str(Path(__file__).parent / "token_stats.json")
 # Hard floor for search results. The FastMCP instructions below quote this same
 # constant, so the tool description can never drift from what the code does.
-MIN_SIMILARITY = 0.15
+# 2026-09-05: 0.15 dan 0.05 ga tushirildi. Sabab o'lchandi — embedder
+# (all-MiniLM-L6-v2) inglizcha uchun o'qitilgan, o'zbekcha so'rovda ballar
+# past chiqadi. "Dify LLM ilova platformasi" so'rovi TO'G'RI hujjatni
+# birinchi o'ringa qo'ydi, lekin ball 0.13 edi — eski chegara uni tashlab
+# yuborardi va foydalanuvchi "hech narsa topilmadi" javobini olardi.
+# Tartib to'g'ri, ballar past: shuning uchun chegara pasaytirildi, embedder
+# emas (uni almashtirish 17 000+ chunkni qayta indekslashni talab qiladi).
+MIN_SIMILARITY = 0.05
 # Claude Code starts the MCP server in the session's working directory,
 # so the folder name identifies which project a memory belongs to.
 PROJECT = Path(os.getcwd()).name or "unknown"

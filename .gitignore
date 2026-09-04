@@ -17,6 +17,12 @@ models_config.json
 # Session artefacts from agy-run.py (briefs, reports) — working notes, not code
 .agy/
 
+# Local DB backups made before risky reindexing (hundreds of MB)
+kg_db-zaxira-*/
+
+# agy-run.py report artefact
+_HISOBOT.md
+
 # Logs
 *.log
 
