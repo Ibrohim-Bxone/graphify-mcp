@@ -11,12 +11,9 @@ from pathlib import Path
 
 import numpy as np
 from flask import Flask, jsonify, redirect, request
-import chromadb
 
+from db import DB_PATH, COLLECTION, col, client, get_collection, reopen, db_retry
 from embedders import BACKENDS, load_models_config, save_models_config
-
-DB_PATH = str(Path(__file__).parent / "kg_db")
-COLLECTION = "graphify"
 # Running token-savings counters written by server.py's search_knowledge (see
 # there for the estimation method). Read-only here.
 STATS_PATH = str(Path(__file__).parent / "token_stats.json")
@@ -35,8 +32,6 @@ KIND_TEXT = {'decision': '155724', 'summary': '0c5460', 'note': '856404', 'doc':
 PROJECT_PALETTE = ['e83e8c', 'fd7e14', '6610f2', '20c997', '0d6efd', 'd63384', '198754', 'cfa100']
 
 app = Flask(__name__)
-client = chromadb.PersistentClient(path=DB_PATH)
-col = client.get_or_create_collection(COLLECTION, metadata={"hnsw:space": "cosine"})
 
 
 def esc(value) -> str:
@@ -50,6 +45,7 @@ def safe_kind(kind) -> str:
 
 
 def get_all_memories():
+    """Barcha xotiralarni bazadan oladi (db.col orqali, kesh eskirganda avtomatik yangilanadi)."""
     res = col.get(include=['metadatas', 'documents'])
     memories = []
     for id_, meta, doc in zip(res['ids'], res['metadatas'], res['documents']):
@@ -708,6 +704,7 @@ def index():
 
 @app.route('/api/graph-data')
 def graph_data():
+    """Semantik graf ko'rinishi uchun tugunlar va o'xshashlik qirralarini hisoblab qaytaradi (db.col orqali)."""
     res = col.get(include=['metadatas', 'embeddings', 'documents'])
     ids = res['ids']
     metas = res['metadatas']
@@ -760,6 +757,7 @@ def graph_data():
 
 @app.route('/delete', methods=['POST'])
 def delete_memory():
+    """Xotirani bazadan o'chiradi (db.col orqali)."""
     mem_id = request.form.get('id')
     if mem_id:
         col.delete(ids=[mem_id])
