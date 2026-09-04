@@ -3,10 +3,19 @@ __pycache__/
 *.pyc
 .venv/
 
+# Secrets
+.env
+.env.local
+
 # Personal data — this is a local knowledge base, never publish real content
 kg_db/
+knowledge/
+*.sqlite3-shm
 token_stats.json
 models_config.json
+
+# Session artefacts from agy-run.py (briefs, reports) — working notes, not code
+.agy/
 
 # Logs
 *.log
