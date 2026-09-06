@@ -36,14 +36,11 @@ from db import (
 STATS_PATH = str(Path(__file__).parent / "token_stats.json")
 # Hard floor for search results. The FastMCP instructions below quote this same
 # constant, so the tool description can never drift from what the code does.
-# 2026-09-05: 0.15 dan 0.05 ga tushirildi. Sabab o'lchandi — embedder
-# (all-MiniLM-L6-v2) inglizcha uchun o'qitilgan, o'zbekcha so'rovda ballar
-# past chiqadi. "Dify LLM ilova platformasi" so'rovi TO'G'RI hujjatni
-# birinchi o'ringa qo'ydi, lekin ball 0.13 edi — eski chegara uni tashlab
-# yuborardi va foydalanuvchi "hech narsa topilmadi" javobini olardi.
-# Tartib to'g'ri, ballar past: shuning uchun chegara pasaytirildi, embedder
-# emas (uni almashtirish 17 000+ chunkni qayta indekslashni talab qiladi).
-MIN_SIMILARITY = 0.05
+# 2026-09-05: O'lchovlar ko'rsatdiki, bu embedding modelida cosine kattaligi
+# mos va mos bo'lmagan natijani ajratmaydi (aloqasiz so'rov 0.50, haqiqiy moslik 0.31).
+# Shuning uchun MIN_SIMILARITY faqatgina butunlay bog'liqsiz axlatni filtrlash uchun 0.10 qilib
+# belgilandi. Haqiqiy ajratish gibrid qidiruv (kalit so'z + RRF + manba bo'yicha guruhlash) orqali keladi.
+MIN_SIMILARITY = float(os.environ.get("GRAPHIFY_MIN_SIMILARITY", "0.10"))
 # Claude Code starts the MCP server in the session's working directory,
 # so the folder name identifies which project a memory belongs to.
 PROJECT = Path(os.getcwd()).name or "unknown"
@@ -61,7 +58,7 @@ mcp = FastMCP(
         "prior decisions, prompts and session summaries instead of asking the user or "
         "re-reading many files. At the END of a substantial session, call save_memory "
         "with a short summary of what was done and decided. "
-        f"Ignore results with similarity below {MIN_SIMILARITY}. By DEFAULT search is scoped to "
+        f"Ignore results with similarity below {MIN_SIMILARITY}. Note: this threshold does NOT guarantee relevance; measurements show that for this embedding model, cosine magnitude does not separate relevant and irrelevant results (irrelevant query can score 0.50, true match 0.31). Real separation already comes from hybrid search (vector + keyword + RRF + source grouping), which runs on every search_knowledge call. Entries found only via keyword match (similarity: 0.00) are NOT filtered by this threshold — it applies to vector-search candidates only, so do not discard a sim=0.00 result on that basis alone. Each candidate must additionally pass a lexical-coverage check (most of the query's words must appear verbatim in the text), so a status:\"insufficient_evidence\" reply does not mean the information doesn't exist — it often means the query's wording differs from the source; try rephrasing the query closer to the document's own words. By DEFAULT search is scoped to "
         "the CURRENT project PLUS the always-open projects (" + ", ".join(ALWAYS_OPEN) + "): "
         "other projects' private memories never leak in, but the shared knowledge base "
         "is reachable from everywhere. Pass project='all' to search every project, or an "
@@ -104,6 +101,32 @@ def _save_token_stats(stats: dict) -> None:
             pass
 
 
+import collections
+
+_est_tokens_cache = collections.OrderedDict()
+
+def warm_savings_cache(where) -> None:
+    """Pre-compute the total would_have_tokens for a given query scope."""
+    from db import get_db_mtime
+    import json
+    try:
+        where_json = json.dumps(where, sort_keys=True) if where else ""
+        mtime = get_db_mtime()
+        cache_key = (where_json, mtime)
+        
+        pool = _col.get(where=where, include=["documents", "metadatas"])
+        total = sum(
+            (meta or {}).get("est_tokens") or _est_tokens(doc)
+            for doc, meta in zip(pool.get("documents", []), pool.get("metadatas", []))
+        )
+        
+        _est_tokens_cache[cache_key] = total
+        if len(_est_tokens_cache) > 32:
+            _est_tokens_cache.popitem(last=False)
+    except Exception as err:
+        print(f"[graphify] warm_savings_cache failed: {err}", file=sys.stderr)
+
+
 def _record_search_savings(where, returned_tokens: int) -> None:
     """Update the running would-have-vs-actual token counters (ESTIMATE only).
 
@@ -113,17 +136,23 @@ def _record_search_savings(where, returned_tokens: int) -> None:
     actually returned this call. The gap between the two is the savings
     surfaced on the dashboard.
     """
-    pool = _col.get(where=where, include=["documents", "metadatas"])
-    would_have = sum(
-        (meta or {}).get("est_tokens") or _est_tokens(doc)
-        for doc, meta in zip(pool["documents"], pool["metadatas"])
-    )
-    if would_have <= 0:
-        return
-    stats = _load_token_stats()
-    stats["would_have_tokens"] += would_have
-    stats["actual_tokens"] += returned_tokens
-    _save_token_stats(stats)
+    from db import get_db_mtime
+    import json
+
+    where_json = json.dumps(where, sort_keys=True) if where else ""
+    mtime = get_db_mtime()
+    cache_key = (where_json, mtime)
+
+    if cache_key in _est_tokens_cache:
+        would_have = _est_tokens_cache[cache_key]
+        if would_have > 0:
+            stats = _load_token_stats()
+            stats["would_have_tokens"] += would_have
+            stats["actual_tokens"] += returned_tokens
+            _save_token_stats(stats)
+    else:
+        # Kesh promahida statistika shu chaqiruvda o'tkazib yuboriladi
+        pass
 
 
 def _open_collection():
@@ -165,6 +194,7 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
     Returns:
         Matched entries formatted with kind, title, project, source, date, author (if available),
         similarity score, and snippet.
+        Note: The similarity score is a measure of relative semantic proximity, NOT a probability of correctness.
     """
     # Yuqori chegara 30 ga ko'tarildi (2026-09-04 e'tirozi: 10 ta cheklov 10 dan ortiq mos yozuv bo'lganda natijalarni kesib qo'yardi).
     # Sukut qiymati 5 bo'lib qoladi (har bir so'rovda ortiqcha token sarflanishining oldini olish uchun).
@@ -183,27 +213,64 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
     where = filters[0] if len(filters) == 1 else ({"$and": filters} if filters else None)
     if _col.count() == 0:
         return "Knowledge base is empty. Nothing indexed yet."
-    res = _col.query(
-        query_texts=[query],
-        n_results=min(top_k, _col.count()),
+    import search_core
+    import keyword_index
+    kw_idx = keyword_index.get_index()
+    
+    res = search_core.hybrid_search(
+        query=query,
+        top_k=top_k,
         where=where,
-        include=["documents", "metadatas", "distances"],
+        collection=_col,
+        kw_index=kw_idx,
+        min_similarity=MIN_SIMILARITY
     )
+    
+    if res["status"] == "insufficient_evidence":
+        return "Bu so'rov uchun yetarli mos dalil topilmadi."
+        
     out = []
     returned_tokens = 0
-    for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
-        sim = 1.0 - dist
-        if sim < MIN_SIMILARITY:
-            continue
-        meta = meta or {}
+    for item in res["results"]:
+        meta = item["meta"] or {}
+        doc = item["text"]
+        sim = item.get("similarity", 0.0)
         returned_tokens += _est_tokens(doc)
         author_part = f" | author: {meta.get('author')}" if meta.get("author") else ""
+        
+        boshqa_text = ""
+        boshqa = item.get("boshqa_boshqalar", [])
+        if boshqa:
+            boshqa_lines = []
+            for b in boshqa[:3]:
+                b_meta = b.get("meta", {})
+                # id nomzodning O'ZIDA saqlanadi (b["id"]), meta ichida EMAS —
+                # kalit so'z orqali topilgan nomzodlarning meta'sida "id" maydoni
+                # umuman yo'q (keyword_index faqat project/kind/parent_id
+                # saqlaydi), shuning uchun b_meta.get("id") doim "?" berardi.
+                boshqa_lines.append(f"  - {b.get('id') or b_meta.get('id', '?')}: {b.get('text', '')[:60]}...")
+            if len(boshqa) > 3:
+                boshqa_lines.append(f"  - (... va yana {len(boshqa)-3} ta bo'lak)")
+            boshqa_text = "\nBoshqa bo'laklar:\n" + "\n".join(boshqa_lines)
+            
         out.append(
             f"[{meta.get('kind', 'doc')}] {meta.get('title', '(untitled)')} "
             f"| project: {meta.get('project', '?')} | source: {meta.get('source', '?')} "
             f"| date: {meta.get('date', '?')}{author_part} "
-            f"| similarity: {sim:.2f} | id: {meta.get('id', '?')}\n{doc}"
+            f"| similarity: {sim:.2f} | id: {meta.get('id', '?')}\n{doc}{boshqa_text}"
         )
+        
+    related = res.get("related_candidates", [])
+    if related:
+        rel_lines = ["\n[Qo'shimcha mosliklar (dalil yetarli emas, faqat nomzod)]"]
+        for r in related[:5]:
+            r_meta = r.get("meta", {})
+            r_sim = r.get("similarity", 0.0)
+            rel_lines.append(f"- {r_meta.get('title', '?')} ({r_meta.get('id', '?')}) sim={r_sim:.2f}")
+        if len(related) > 5:
+            rel_lines.append(f"- (... va yana {len(related)-5} ta)")
+        out.append("\n".join(rel_lines))
+        
     try:
         _record_search_savings(where, returned_tokens)
     except Exception as err:
@@ -216,7 +283,8 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
 @mcp.tool()
 @_db_retry
 def save_memory(content: str, title: str, kind: str = "note", tags: str = "",
-                 shared: bool = False, author: str = "") -> str:
+                 shared: bool = False, author: str = "",
+                 private: bool = False) -> str:
     """Save a memory (decision, session summary, note or important prompt) to the knowledge base.
 
     Args:
@@ -232,11 +300,21 @@ def save_memory(content: str, title: str, kind: str = "note", tags: str = "",
             it would only surface for someone who already knew to look here.
         author: optional author/contributor identifier. If empty, falls back to the
             GRAPHIFY_AUTHOR environment variable (or empty string if unset).
+        private: pass True to scope this memory to the CURRENT project only
+            (project = the working directory name). Default False saves under the
+            first ALWAYS_OPEN project so every project's default search finds it;
+            the working directory name is still recorded in "origin_project".
     """
     author = str(author or os.environ.get("GRAPHIFY_AUTHOR", "") or "").strip()
     if kind not in ("decision", "summary", "note", "prompt", "doc"):
         kind = "note"
-    project = ALWAYS_OPEN[0] if shared and ALWAYS_OPEN else PROJECT
+    # 2026-09-05: sukut TESKARIGA o'zgartirildi. Avval xotira joriy papka nomi
+    # bilan yozilardi (PROJECT = cwd nomi), shuning uchun boshqa papkadan
+    # qidirilganda TOPILMASDI: 392 xotiradan 328 tasi shu sababdan ko'rinmay
+    # qolgan edi. Endi sukut ALWAYS_OPEN[0] ("shared") - xotira hamma joydan
+    # topiladi. Papka nomi yo'qolmaydi, "origin_project" da saqlanadi.
+    # Faqat bitta papkaga tegishli xotira uchun private=True bering.
+    project = PROJECT if private else (ALWAYS_OPEN[0] if ALWAYS_OPEN else PROJECT)
     mem_id = f"mem_{uuid.uuid4().hex[:12]}"
     _col.add(
         ids=[mem_id],
@@ -248,6 +326,7 @@ def save_memory(content: str, title: str, kind: str = "note", tags: str = "",
             "tags": tags,
             "source": "save_memory",
             "project": project,
+            "origin_project": PROJECT,
             "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "author": author,
             "est_tokens": _est_tokens(content),

@@ -39,3 +39,23 @@ CLAUDE.md
 # OS
 Thumbs.db
 .DS_Store
+.http-token
+
+# --- 2026-09-06 xavfsizlik tuzatishi ---
+# Baza zaxiralari va vaqtinchalik nusxalari (jami ~2.5 GB, shaxsiy bilim bazasi).
+# Avval faqat `kg_db/` yozilgan edi — zaxiralar himoyasiz qolgan edi.
+kg_db*/
+*.bak-S-*
+*.buzuq-S-*
+*.ishlaydi-S-*
+
+# Ish jarayonidagi vaqtinchalik skriptlar va sinov chiqishlari
+scratch_*.py
+do_rewrite.py
+fix_newlines.py
+test_b2.txt
+test_speed.py
+.sample-sessions/
+
+# Node (github-tayyor.py talabi)
+node_modules/

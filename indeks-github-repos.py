@@ -1,6 +1,6 @@
 """github-repos dan qimmatli hujjatlarni tanlab indekslash skripti.
 
-Ushbu skript `D:\\claude projects\\Promtlarim\\github-repos` ichidagi 18 ta repozitoriyani
+Ushbu skript `D:\\claude projects\\graphify-ekotizim\\Promtlarim\\github-repos` ichidagi 18 ta repozitoriyani
 tahlil qilib, 8497+ ta fayldan faqat eng yuqori qiymatga ega bo'lgan 300-800 ta hujjatni
 tanlaydi va `indexer.py` orqali `--project github-repos --kind doc` sifatida indekslaydi.
 
@@ -35,7 +35,7 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
 
 from db import flush_index
 
-SRC_DIR = Path(r"D:\claude projects\Promtlarim\github-repos")
+SRC_DIR = Path(r"D:\claude projects\graphify-ekotizim\Promtlarim\github-repos")
 GRAPHIFY_DIR = Path(__file__).resolve().parent
 INDEXER_PATH = GRAPHIFY_DIR / "indexer.py"
 

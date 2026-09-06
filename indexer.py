@@ -26,25 +26,17 @@ CHUNK_SIZE = 1500
 OVERLAP = 150
 
 
-def chunk_text(text: str):
-    text = text.strip()
-    if not text:
-        return
-    start = 0
-    while start < len(text):
-        end = min(start + CHUNK_SIZE, len(text))
-        # try to break at a paragraph or sentence boundary
-        if end < len(text):
-            for sep in ("\n\n", "\n", ". "):
-                cut = text.rfind(sep, start + CHUNK_SIZE // 2, end)
-                if cut != -1:
-                    end = cut + len(sep)
-                    break
-        yield text[start:end].strip()
-        if end >= len(text):
-            break
-        start = end - OVERLAP
+import re
+from chunking import chunk_by_tokens
 
+def has_shortcode_frontmatter(text: str) -> bool:
+    if not text.startswith("---"):
+        return False
+    end = text.find("\n---", 3)
+    if end == -1:
+        return False
+    frontmatter = text[3:end]
+    return bool(re.search(r'^shortcode:', frontmatter, re.MULTILINE))
 
 def collect_files(paths):
     for p in paths:
@@ -64,6 +56,7 @@ def main():
     ap.add_argument("paths", nargs="+", help="files or folders to index")
     ap.add_argument("--kind", default="doc", help="kind label: doc/prompt/note (default: doc)")
     ap.add_argument("--project", default="shared", help="project label (default: shared = visible everywhere)")
+    ap.add_argument("--dry-run", action="store_true", help="do not write to db, just count")
     args = ap.parse_args()
 
     client = chromadb.PersistentClient(path=DB_PATH)
@@ -72,17 +65,35 @@ def main():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     total_chunks = 0
     total_files = 0
+    skipped_archive_files = 0
+    long_chunks_count = 0
+    
     for f in collect_files(args.paths):
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
             print(f"skip {f}: {e}")
             continue
+            
+        if has_shortcode_frontmatter(text):
+            skipped_archive_files += 1
+            print(f"arxiv — o'tkazib yuborildi: {f}")
+            continue
+            
         ids, docs, metas = [], [], []
-        for i, chunk in enumerate(chunk_text(text)):
-            cid = "file_" + hashlib.sha1(f"{f.resolve()}#{i}".encode()).hexdigest()[:16]
+        parent_id = str(f.resolve())
+        chunks = chunk_by_tokens(text, parent_id=parent_id)
+        
+        for c in chunks:
+            chunk = c["text"]
+            i = c["chunk_index"]
+            cid = "file_" + hashlib.sha1(f"{parent_id}#{i}".encode()).hexdigest()[:16]
             ids.append(cid)
             docs.append(chunk)
+            
+            if c["token_count"] > 256:
+                long_chunks_count += 1
+                
             metas.append({
                 "id": cid,
                 "title": f"{f.name} (part {i + 1})",
@@ -92,17 +103,41 @@ def main():
                 "date": today,
                 "tags": "",
                 "est_tokens": max(1, len(chunk) // 4),  # chars/4 heuristic, see dashboard token-savings stat
+                "parent_id": parent_id,
+                "chunk_index": i,
+                "chunk_total": c["chunk_total"],
+                "token_count": c["token_count"]
             })
+            
         if ids:
-            col.upsert(ids=ids, documents=docs, metadatas=metas)
+            if not args.dry_run:
+                # 1. Get existing IDs for this file
+                res = col.get(where={"source": str(f)}, include=[])
+                existing_ids = res.get("ids", []) if res else []
+                
+                # 2. Upsert new/updated chunks
+                col.upsert(ids=ids, documents=docs, metadatas=metas)
+                
+                import keyword_index
+                keyword_index.get_index().upsert(ids=ids, texts=docs, metadatas=metas)
+                
+                # 3. Delete orphans
+                expected_ids = set(ids)
+                to_delete = [i for i in existing_ids if i not in expected_ids]
+                if to_delete:
+                    col.delete(ids=to_delete)
+                    keyword_index.get_index().delete(ids=to_delete)
+                    
             total_chunks += len(ids)
             total_files += 1
             print(f"indexed: {f} ({len(ids)} chunks)")
 
-    if total_chunks > 0:
+    if total_chunks > 0 and not args.dry_run:
         flush_index(col)
 
-    print(f"\nDone. {total_files} files, {total_chunks} chunks. DB now holds {col.count()} chunks total.")
+    print(f"\nDone. Indekslangan fayl: {total_files}, O'tkazib yuborilgan arxiv fayl: {skipped_archive_files}, Jami chunk: {total_chunks}, 256 tokendan uzun chunk soni: {long_chunks_count}.")
+    if not args.dry_run:
+        print(f"DB now holds {col.count()} chunks total.")
 
 
 if __name__ == "__main__":
