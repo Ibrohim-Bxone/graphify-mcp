@@ -5,7 +5,7 @@ shakliga keltiradi (knowledge/code-sessions/<papka-slug>/<sana>-<slug>.md),
 so'ng indexer.py orqali Graphify vektor bazasiga indekslaydi.
 
 Foydalanish:
-    # Standart manba (C:\\Users\\user\\.claude\\projects)
+    # Standart manba: ~/.claude/projects (CLAUDE_PROJECTS_DIR bilan o'zgartiriladi)
     .venv\\Scripts\\python.exe import_claude_code_sessions.py
 
     # Sinov / test uchun namuna papkadan o'qish, indekslamaslik
@@ -17,6 +17,7 @@ Foydalanish:
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -27,7 +28,9 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_SRC = Path(r"C:\Users\user\.claude\projects")
+# Foydalanuvchi uy papkasidan aniqlanadi — qattiq yozilgan C:\Users\<nom>\...
+# boshqa kompyuterda ishlamaydi va ochiq repoda foydalanuvchi nomini oshkor qiladi.
+DEFAULT_SRC = Path(os.getenv("CLAUDE_PROJECTS_DIR") or (Path.home() / ".claude" / "projects"))
 OUTPUT_BASE = ROOT / "knowledge" / "code-sessions"
 
 
