@@ -292,33 +292,38 @@ def get_index():
     return _index_singleton
 
 def rebuild():
-    print("Kalit so'z indeksini qayta qurish (bu biroz vaqt olishi mumkin)...")
-    import chromadb
-    client = chromadb.PersistentClient(path=str(DB_PATH.parent.parent / "kg_db"))
-    col = client.get_collection("graphify")
-    
-    idx = KeywordIndex()
-    with idx.conn:
-        idx.conn.execute("DROP TABLE IF EXISTS docs")
+    print("OGOHLANTIRISH: Barcha servislarni to'xtatganingizga ishonch hosil qiling!")
+    import sys
+    sys.path.append(str(Path(__file__).parent))
+    import yozuv
+    with yozuv.lock():
+        print("Kalit so'z indeksini qayta qurish (bu biroz vaqt olishi mumkin)...")
+        import chromadb
+        client = chromadb.PersistentClient(path=str(DB_PATH.parent.parent / "kg_db"))
+        col = client.get_collection("graphify")
+        
+        idx = KeywordIndex()
+        with idx.conn:
+            idx.conn.execute("DROP TABLE IF EXISTS docs")
         idx.conn.execute("DROP TABLE IF EXISTS fts_idx")
         idx.conn.execute("DROP TABLE IF EXISTS py_term_freqs")
-    idx._init_db()
-    
-    # Process in batches
-    data = col.get(include=["documents", "metadatas"])
-    ids = data["ids"]
-    docs = data["documents"]
-    metas = data["metadatas"]
-    
-    batch_size = 500
-    for i in range(0, len(ids), batch_size):
-        idx.upsert(
-            ids[i:i+batch_size], 
-            docs[i:i+batch_size], 
-            metas[i:i+batch_size]
-        )
-        print(f"{i + len(ids[i:i+batch_size])}/{len(ids)} indekslandi...")
-    print("Tayyor.")
+        idx._init_db()
+        
+        # Process in batches
+        data = col.get(include=["documents", "metadatas"])
+        ids = data["ids"]
+        docs = data["documents"]
+        metas = data["metadatas"]
+        
+        batch_size = 500
+        for i in range(0, len(ids), batch_size):
+            idx.upsert(
+                ids[i:i+batch_size], 
+                docs[i:i+batch_size], 
+                metas[i:i+batch_size]
+            )
+            print(f"{i + len(ids[i:i+batch_size])}/{len(ids)} indekslandi...")
+        print("Tayyor.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

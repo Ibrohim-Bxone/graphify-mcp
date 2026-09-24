@@ -57,6 +57,7 @@ def main():
     ap.add_argument("--kind", default="doc", help="kind label: doc/prompt/note (default: doc)")
     ap.add_argument("--project", default="shared", help="project label (default: shared = visible everywhere)")
     ap.add_argument("--dry-run", action="store_true", help="do not write to db, just count")
+    ap.add_argument("--prune", action="store_true", help="diskda yo'q fayllarni indeksdan o'chirish")
     args = ap.parse_args()
 
     client = chromadb.PersistentClient(path=DB_PATH)
@@ -115,25 +116,52 @@ def main():
                 res = col.get(where={"source": str(f)}, include=[])
                 existing_ids = res.get("ids", []) if res else []
                 
-                # 2. Upsert new/updated chunks
-                col.upsert(ids=ids, documents=docs, metadatas=metas)
-                
-                import keyword_index
-                keyword_index.get_index().upsert(ids=ids, texts=docs, metadatas=metas)
+                import yozuv
+                yozuv.upsert(col, ids=ids, documents=docs, metadatas=metas)
                 
                 # 3. Delete orphans
                 expected_ids = set(ids)
                 to_delete = [i for i in existing_ids if i not in expected_ids]
                 if to_delete:
-                    col.delete(ids=to_delete)
-                    keyword_index.get_index().delete(ids=to_delete)
-                    
+                    yozuv.delete(col, ids=to_delete)
+            
+            # Fayl bo'sh bo'lsa `ids` bo'sh bo'ladi, uning `to_delete` si `existing_ids` ga teng bo'ladi.
+            # Lekin if not args.dry_run va if ids degan shart bor edi. 
+            # Buni tahrirlaymiz:
+            # Fayl bo'sh (ids bo'sh) bo'lsa, uni o'chirish kerak:
+        else:
+            if not args.dry_run:
+                res = col.get(where={"source": str(f)}, include=[])
+                existing_ids = res.get("ids", []) if res else []
+                if existing_ids:
+                    import yozuv
+                    yozuv.delete(col, ids=existing_ids)
+            print(f"indexed: {f} (empty, deleted {len(existing_ids) if not args.dry_run else '?'} chunks)")
+
+        if ids:
             total_chunks += len(ids)
             total_files += 1
             print(f"indexed: {f} ({len(ids)} chunks)")
 
     if total_chunks > 0 and not args.dry_run:
         flush_index(col)
+
+    if args.prune and not args.dry_run:
+        all_res = col.get(include=["metadatas"])
+        if all_res and all_res.get("metadatas"):
+            to_delete = []
+            resolved_paths = [Path(p).resolve() for p in args.paths]
+            for meta, _id in zip(all_res["metadatas"], all_res["ids"]):
+                source = meta.get("source") if meta else None
+                if source:
+                    src_path = Path(source).resolve()
+                    is_in_paths = any(src_path == p or p in src_path.parents for p in resolved_paths)
+                    if is_in_paths and not src_path.exists():
+                        to_delete.append(_id)
+            if to_delete:
+                print(f"Pruning {len(to_delete)} chunks from missing files...")
+                import yozuv
+                yozuv.delete(col, ids=to_delete)
 
     print(f"\nDone. Indekslangan fayl: {total_files}, O'tkazib yuborilgan arxiv fayl: {skipped_archive_files}, Jami chunk: {total_chunks}, 256 tokendan uzun chunk soni: {long_chunks_count}.")
     if not args.dry_run:

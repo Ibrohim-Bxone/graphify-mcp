@@ -175,6 +175,40 @@ def almashtir(graphify_dir):
         print("Xato: kg_db-yangi barmoq izi mos emas (tekshiruvdan keyin o'zgargan).")
         sys.exit(1)
         
+    print("Ko'chirish: Eski bazadagi BARCHA 'save_memory' yozuvlarini yangisiga o'tkazish (yangi qo'shilganlari yo'qolmasligi uchun)...")
+    try:
+        client_old = chromadb.PersistentClient(path=str(kg_db))
+        col_old = client_old.get_collection("graphify")
+        res_mem_old = col_old.get(where={"source": "save_memory"}, include=["documents", "metadatas", "embeddings"])
+        res_mem_new = col_new.get(where={"source": "save_memory"}, include=[])
+        old_ids = set(res_mem_old.get("ids", [])) if res_mem_old else set()
+        new_ids = set(res_mem_new.get("ids", [])) if res_mem_new else set()
+        
+        to_delete = list(new_ids - old_ids)
+        if to_delete:
+            col_new.delete(ids=to_delete)
+            
+        if res_mem_old and res_mem_old.get("ids"):
+            col_new.upsert(
+                ids=res_mem_old["ids"],
+                documents=res_mem_old["documents"],
+                metadatas=res_mem_old["metadatas"],
+                embeddings=res_mem_old["embeddings"]
+            )
+        print(f"{len(res_mem_old.get('ids', []))} ta 'save_memory' yozuvi yangi bazaga to'liq sinxronlandi. {len(to_delete)} ta o'chirildi.")
+        
+        try:
+            if hasattr(client_old, "_system"):
+                client_old._system.stop()
+            if hasattr(client_new, "_system"):
+                client_new._system.stop()
+            chromadb.api.client.SharedSystemClient.clear_system_cache()
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"Xato: 'save_memory' ko'chirishda xatolik: {e}")
+        sys.exit(1)
+        
     sana = datetime.now().strftime("%Y%m%d-%H%M%S")
     eski_nom = f"kg_db-eski-{sana}"
     kg_db_eski = graphify_dir / eski_nom
@@ -196,6 +230,10 @@ def almashtir(graphify_dir):
         sys.exit(1)
         
     print("Muvaffaqiyatli almashtirildi!")
+    
+    print("\n--- FTS Indeksini qayta qurish ---")
+    import keyword_index
+    keyword_index.rebuild()
 
 def qaytar(graphify_dir, eski_nomi):
     kg_db = graphify_dir / "kg_db"
@@ -566,9 +604,9 @@ def build_new_db(jarayon_soni=None):
         print("Indeksni almashtirishga tayyor. Ishga tushiring: python indeks-qayta-qur.py --almashtir")
 
 def main():
-    parser = argparse.ArgumentParser(description="Indeksni qayta qurish va almashtirish")
+    parser = argparse.ArgumentParser(description="Indeksni qayta qurish va almashtirish. Ogohlantirish: avval hamma servislarni to'xtating!")
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--almashtir", action="store_true", help="Yangi indeksni joriy qilib, eskini zaxiralash")
+    group.add_argument("--almashtir", action="store_true", help="Yangi indeksni joriy qilib, eskini zaxiralash (avval hamma servislarni to'xtating)")
     group.add_argument("--qaytar", metavar="ESKI_NOM", help="Zaxiralangan indeksga qaytarish (masalan: kg_db-eski-20260905-120000)")
     group.add_argument("--yangidan", action="store_true", help="Mavjud kg_db-yangi ni tozalab, noldan qayta qurish")
     parser.add_argument("--jarayon", type=int, default=None, help="Ishchi jarayonlar soni (multiprocessing uchun)")

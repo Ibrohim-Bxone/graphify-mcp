@@ -74,27 +74,74 @@ def _est_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+import contextlib
+import time
+
+@contextlib.contextmanager
+def _stats_lock():
+    lock_file = STATS_PATH + ".lock"
+    f = open(lock_file, "w")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            start = time.monotonic()
+            while True:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() - start > 10:
+                        raise RuntimeError("token_stats qulflanib qoldi")
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            start = time.monotonic()
+            while True:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() - start > 10:
+                        raise RuntimeError("token_stats qulflanib qoldi")
+                    time.sleep(0.05)
+        yield
+    finally:
+        if sys.platform == "win32":
+            import msvcrt
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        f.close()
+
+
 def _load_token_stats() -> dict:
     try:
-        with open(STATS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return {
-            "would_have_tokens": int(data.get("would_have_tokens", 0)),
-            "actual_tokens": int(data.get("actual_tokens", 0)),
-        }
-    except (OSError, ValueError):
+        with _stats_lock():
+            with open(STATS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {
+                "would_have_tokens": int(data.get("would_have_tokens", 0)),
+                "actual_tokens": int(data.get("actual_tokens", 0)),
+            }
+    except (OSError, ValueError, RuntimeError):
         return {"would_have_tokens": 0, "actual_tokens": 0}
 
 
 def _save_token_stats(stats: dict) -> None:
-    # Atomic replace: the bot and the MCP server can both be running, and a
-    # half-written file was silently resetting the counters to zero on read.
     tmp = f"{STATS_PATH}.{uuid.uuid4().hex}.tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(stats, f)
-        os.replace(tmp, STATS_PATH)
-    except OSError:
+        with _stats_lock():
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(stats, f)
+            os.replace(tmp, STATS_PATH)
+    except (OSError, RuntimeError):
         try:
             os.unlink(tmp)
         except OSError:
@@ -146,10 +193,30 @@ def _record_search_savings(where, returned_tokens: int) -> None:
     if cache_key in _est_tokens_cache:
         would_have = _est_tokens_cache[cache_key]
         if would_have > 0:
-            stats = _load_token_stats()
-            stats["would_have_tokens"] += would_have
-            stats["actual_tokens"] += returned_tokens
-            _save_token_stats(stats)
+            try:
+                with _stats_lock():
+                    try:
+                        with open(STATS_PATH, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        stats = {
+                            "would_have_tokens": int(data.get("would_have_tokens", 0)),
+                            "actual_tokens": int(data.get("actual_tokens", 0)),
+                        }
+                    except (OSError, ValueError):
+                        stats = {"would_have_tokens": 0, "actual_tokens": 0}
+                        
+                    stats["would_have_tokens"] += would_have
+                    stats["actual_tokens"] += returned_tokens
+                    
+                    tmp = f"{STATS_PATH}.{uuid.uuid4().hex}.tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(stats, f)
+                    os.replace(tmp, STATS_PATH)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
     else:
         # Kesh promahida statistika shu chaqiruvda o'tkazib yuboriladi
         pass
@@ -316,7 +383,9 @@ def save_memory(content: str, title: str, kind: str = "note", tags: str = "",
     # Faqat bitta papkaga tegishli xotira uchun private=True bering.
     project = PROJECT if private else (ALWAYS_OPEN[0] if ALWAYS_OPEN else PROJECT)
     mem_id = f"mem_{uuid.uuid4().hex[:12]}"
-    _col.add(
+    import yozuv
+    yozuv.upsert(
+        _col,
         ids=[mem_id],
         documents=[content],
         metadatas=[{
@@ -366,7 +435,8 @@ def delete_memory(memory_id: str) -> str:
     this deletes ONLY that single chunk. To delete an entire Instagram post and all its chunks,
     use delete_by_shortcode(shortcode) instead.
     """
-    _col.delete(ids=[memory_id])
+    import yozuv
+    yozuv.delete(_col, ids=[memory_id])
     return f"Deleted {memory_id}"
 
 
@@ -394,7 +464,8 @@ def delete_by_shortcode(shortcode: str) -> str:
     count = len(ids)
     if count == 0:
         return f"No entries found for shortcode '{shortcode}'."
-    _col.delete(where={"shortcode": shortcode})
+    import yozuv
+    yozuv.delete(_col, ids=ids)
     return (
         f"Deleted {count} entries for shortcode '{shortcode}'. "
         f"Note: Markdown archive file ({shortcode}.md) was not deleted; delete it on the bot side if needed."

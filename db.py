@@ -200,17 +200,19 @@ def flush_index(target_col=None) -> bool:
     target_seq = vec_seq + sync_threshold
     needed = max(1, target_seq - meta_seq)
 
-    pool = target_col.get(limit=needed, include=["documents", "metadatas", "embeddings"])
-    ids = pool.get("ids", [])
-    if not ids:
-        return False
+    import yozuv
+    with yozuv.lock():
+        pool = target_col.get(limit=needed, include=["documents", "metadatas", "embeddings"])
+        ids = pool.get("ids", [])
+        if not ids:
+            return False
 
-    target_col.upsert(
-        ids=ids,
-        documents=pool.get("documents") if pool.get("documents") is not None else None,
-        metadatas=pool.get("metadatas") if pool.get("metadatas") is not None else None,
-        embeddings=pool.get("embeddings") if pool.get("embeddings") is not None else None,
-    )
+        target_col.upsert(
+            ids=ids,
+            documents=pool.get("documents") if pool.get("documents") is not None else None,
+            metadatas=pool.get("metadatas") if pool.get("metadatas") is not None else None,
+            embeddings=pool.get("embeddings") if pool.get("embeddings") is not None else None,
+        )
 
     notify_write()
     return True

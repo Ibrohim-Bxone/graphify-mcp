@@ -119,12 +119,20 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
         query_kwargs["query_texts"] = [query]
         
     try:
-        res = collection.query(
-            n_results=min(50, getattr(collection, 'count', lambda: 50)() or 50),
-            where=where,
-            include=include_fields,
-            **query_kwargs
-        )
+        count = collection.count()
+    except Exception:
+        count = 50
+
+    try:
+        if count == 0:
+            res = {}
+        else:
+            res = collection.query(
+                n_results=min(max(50, top_k * 5), count),
+                where=where,
+                include=include_fields,
+                **query_kwargs
+            )
         if res and res.get("ids") and res["ids"][0]:
             docs = res["documents"][0] if res.get("documents") else []
             metas = res["metadatas"][0] if res.get("metadatas") else []
@@ -145,6 +153,9 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
                     })
     except Exception as e:
         import sys
+        err_msg = str(e).lower()
+        if any(s in err_msg for s in ["stale", "does not exist", "not found", "error finding id"]):
+            raise
         print(f"[hybrid_search] Vector search error: {e}", file=sys.stderr)
         
     # 2. Fetch 50 from Keyword
@@ -165,17 +176,26 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
                         kw_filters["kind"] = cond["kind"]
         
         kw_res = kw_index.search(query, limit=50, filters=kw_filters)
-        for r in kw_res:
-            kw_candidates.append({
-                "id": r["id"],
-                "text": r["text"],
-                "meta": {
-                    "project": r["project"],
-                    "kind": r["kind"],
-                    "parent_id": r["parent_id"]
-                },
-                "score": r["score"]
-            })
+        kw_ids = [r["id"] for r in kw_res]
+        if kw_ids:
+            try:
+                exist_res = collection.get(ids=kw_ids, include=[])
+                exist_ids = set(exist_res.get("ids", []))
+            except Exception:
+                exist_ids = set()
+                
+            for r in kw_res:
+                if r["id"] in exist_ids:
+                    kw_candidates.append({
+                        "id": r["id"],
+                        "text": r["text"],
+                        "meta": {
+                            "project": r["project"],
+                            "kind": r["kind"],
+                            "parent_id": r["parent_id"]
+                        },
+                        "score": r["score"]
+                    })
     except Exception as e:
         import sys
         print(f"[hybrid_search] Keyword search error: {e}", file=sys.stderr)
@@ -238,8 +258,11 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
                         best_c["meta"] = enrich["metadatas"][0]
                     if enrich.get("documents") and enrich["documents"][0]:
                         best_c["text"] = enrich["documents"][0]
+                else:
+                    continue
             except Exception as e:
                 print(f"[search_core] Kalit so'z natijasini boyitishda xato: {e}", file=sys.stderr)
+                continue
 
         all_chunks_for_pid = {}
         for c in vec_all.get(pid, []):

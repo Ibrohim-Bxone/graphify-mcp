@@ -376,7 +376,28 @@ def tuzat_baza():
     backup_path = BASE_DIR / f"kg_db-zaxira-{now_str}"
     print(f"1-qadam: Baza zaxira nusxasi olinmoqda -> {backup_path.name}...")
     try:
-        shutil.copytree(str(DB_PATH), str(backup_path))
+        import sys
+        if str(BASE_DIR) not in sys.path:
+            sys.path.insert(0, str(BASE_DIR))
+        import yozuv
+        with yozuv.lock():
+            backup_path.mkdir(parents=True, exist_ok=True)
+            for item in DB_PATH.iterdir():
+                dest = backup_path / item.name
+                if item.is_file():
+                    if item.suffix == ".sqlite3":
+                        import sqlite3
+                        src_conn = sqlite3.connect(str(item))
+                        dst_conn = sqlite3.connect(str(dest))
+                        with dst_conn:
+                            src_conn.backup(dst_conn)
+                        dst_conn.close()
+                        src_conn.close()
+                    else:
+                        shutil.copy2(str(item), str(dest))
+                elif item.is_dir():
+                    shutil.copytree(str(item), str(dest))
+                    
         if not backup_path.exists() or not any(backup_path.iterdir()):
             raise RuntimeError("Zaxira papkasi bo'sh qoldi.")
         print(f"✅ 1. Majburiy zaxira muvaffaqiyatli olindi: {backup_path.name}")
