@@ -8,6 +8,38 @@ from collections import defaultdict
 # og'irligining kamida shuncha ulushi hujjatda uchrashi kerak (0.8 = 80%).
 MIN_COVERAGE = 0.8
 
+FUNCTIONAL_WORDS = {
+    "nima", "nimaga", "qanday", "qanaqa", "qaysi", "qayerda", "qachon", "kim", "nega",
+    "qiladi", "qilish", "ishlatiladi", "ishlatish", "haqida", "ber", "bering", "ayt", "aytib",
+    "tushuntir", "ko'rsat", "va", "bilan", "uchun", "bu", "shu", "ma'lumot", "ma'lumotlar",
+    "what", "how", "why", "which", "where", "when", "who", "does", "do", "is", "are",
+    "used", "use", "using", "about", "tell", "me", "explain", "show",
+    "the", "a", "an", "and", "for", "of", "to", "in", "it", "can", "you", "i"
+}
+
+try:
+    import keyword_index as _kw_mod
+    _new_fws = set()
+    for fw in FUNCTIONAL_WORDS:
+        _new_fws.update(_kw_mod.tokenize(fw))
+    FUNCTIONAL_WORDS.update(_new_fws)
+except Exception:
+    pass
+
+def _light_stem(word: str) -> str:
+    """O'zbek qo'shimchalarini kesuvchi yengil stemmer. FTS uchun emas, faqat qamrov hisoblash uchun."""
+    suffixes = ["larning", "larni", "lari", "lar", "ning", "niki", "dagi", "dan", "dek", "cha", "ni", "ga", "da"]
+    while len(word) > 3:
+        changed = False
+        for suf in suffixes:
+            if word.endswith(suf) and len(word) - len(suf) >= 3:
+                word = word[:-len(suf)]
+                changed = True
+                break
+        if not changed:
+            break
+    return word
+
 def extract_strict_constraints(query: str) -> list[str]:
     constraints = []
     # Years: 4 digits, possibly bounded
@@ -27,6 +59,10 @@ def compute_query_term_weights(query: str, kw_index) -> dict[str, float]:
     q_tokens = keyword_index.tokenize(query)
     if not q_tokens:
         return {}
+        
+    meaningful = [t for t in q_tokens if t not in FUNCTIONAL_WORDS]
+    if meaningful:
+        q_tokens = meaningful
 
     conn = kw_index.conn
     N = conn.execute("SELECT COUNT(DISTINCT parent_id) FROM docs").fetchone()[0]
@@ -61,10 +97,12 @@ def coverage_for_text(term_weights: dict[str, float], text: str) -> tuple[float,
         return 0.0, 0
 
     t_tokens = set(keyword_index.tokenize(text))
+    stemmed_t_tokens = {_light_stem(t) for t in t_tokens}
+    
     matched_weight = 0.0
     matched_terms = 0
     for t, weight in term_weights.items():
-        if t in t_tokens:
+        if _light_stem(t) in stemmed_t_tokens:
             matched_weight += weight
             matched_terms += 1
 
@@ -87,8 +125,11 @@ def check_evidence(query: str, chunk_text: str, q_tokens: list[str],
             return False
 
     coverage, matched_terms = coverage_for_text(term_weights, chunk_text)
+    
+    meaningful_q = set(t for t in q_tokens if t not in FUNCTIONAL_WORDS)
+    required_matches = 1 if len(meaningful_q) == 1 else 2
 
-    if coverage >= MIN_COVERAGE and matched_terms >= 2:
+    if coverage >= MIN_COVERAGE and matched_terms >= required_matches:
         return True
 
     return False
