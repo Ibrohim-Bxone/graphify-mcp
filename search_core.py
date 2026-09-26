@@ -28,14 +28,40 @@ except Exception:
 
 def _light_stem(word: str) -> str:
     """O'zbek qo'shimchalarini kesuvchi yengil stemmer. FTS uchun emas, faqat qamrov hisoblash uchun."""
-    suffixes = ["larning", "larni", "lari", "lar", "ning", "niki", "dagi", "dan", "dek", "cha", "ni", "ga", "da"]
+    suffixes = [
+        "larning", "larni", "lari", "lar", "ning", "niki", "dagi", "dan", "dek", "cha", "ni", "ga", "da",
+        "imiz", "ingiz", "si",
+        "amiz", "aymiz", "adimi", "ydimi", "adi", "aydi", "ganmiz", "ganmi", "gan", "dimi", "moqda", "moq", "yapti", "yotgan", "masligi", "ligi", "lik", "ish", "ib",
+        "di", "li", "yot"
+    ]
+    suffixes.sort(key=len, reverse=True)
+    vowels = "aeiouAEIOU"  # "'" unli emas: "tarmog'i" da oldingi harf g' (undosh)
+    
     while len(word) > 3:
         changed = False
         for suf in suffixes:
             if word.endswith(suf) and len(word) - len(suf) >= 3:
-                word = word[:-len(suf)]
+                if suf in ("aymiz", "aydi"):
+                    word = word[:-(len(suf)-1)] # O'zakdagi 'a' ni saqlaymiz
+                else:
+                    word = word[:-len(suf)]
                 changed = True
                 break
+                
+        if not changed:
+            if word.endswith("i") and not word.endswith("mi"):
+                stem = word[:-1]
+                # -i faqat o'zak >= 5 harf va oldingi harf undosh bo'lsa
+                if len(stem) >= 5 and stem[-1] not in vowels:
+                    word = stem
+                    changed = True
+            elif word.endswith("mi"):
+                stem = word[:-2]
+                # -mi faqat o'zak kamida 3-4 harf bo'lsa (ingliz so'zlari buzilmasligi uchun, masalan 3)
+                if len(stem) >= 3:
+                    word = stem
+                    changed = True
+                    
         if not changed:
             break
     return word
@@ -109,22 +135,23 @@ def coverage_for_text(term_weights: dict[str, float], text: str) -> tuple[float,
     return matched_weight / total_weight, matched_terms
 
 def check_evidence(query: str, chunk_text: str, q_tokens: list[str],
-                    constraints: list[str], term_weights: dict[str, float]) -> bool:
+                    constraints: list[str], term_weights: dict[str, float], title: str = "") -> bool:
     """So'rov va nomzod bo'yicha oldindan hisoblangan (bir martalik) qiymatlar
     bilan ishlaydi — kw_index'ga SQL so'rov QILMAYDI, chunki
     compute_query_term_weights allaqachon chaqiruvchida bir marta bajarilgan."""
     import keyword_index
-    t_tokens = set(keyword_index.tokenize(chunk_text))
+    combined_text = chunk_text + (" " + title if title else "")
+    t_tokens = set(keyword_index.tokenize(combined_text))
 
     if len(q_tokens) == 1:
         return q_tokens[0] in t_tokens
 
-    text_lower = chunk_text.lower()
+    text_lower = combined_text.lower()
     for c in constraints:
         if c not in text_lower:
             return False
 
-    coverage, matched_terms = coverage_for_text(term_weights, chunk_text)
+    coverage, matched_terms = coverage_for_text(term_weights, combined_text)
     
     meaningful_q = set(t for t in q_tokens if t not in FUNCTIONAL_WORDS)
     required_matches = 1 if len(meaningful_q) == 1 else 2
@@ -220,21 +247,28 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
         kw_ids = [r["id"] for r in kw_res]
         if kw_ids:
             try:
-                exist_res = collection.get(ids=kw_ids, include=[])
+                exist_res = collection.get(ids=kw_ids, include=["metadatas"])
                 exist_ids = set(exist_res.get("ids", []))
+                exist_metas = {exist_res["ids"][i]: exist_res["metadatas"][i] for i in range(len(exist_res["ids"]))}
             except Exception:
                 exist_ids = set()
+                exist_metas = {}
                 
             for r in kw_res:
                 if r["id"] in exist_ids:
+                    meta_dict = {
+                        "project": r["project"],
+                        "kind": r["kind"],
+                        "parent_id": r["parent_id"],
+                        "id": r["id"]
+                    }
+                    if r["id"] in exist_metas and exist_metas[r["id"]]:
+                        meta_dict.update(exist_metas[r["id"]])
+                    
                     kw_candidates.append({
                         "id": r["id"],
                         "text": r["text"],
-                        "meta": {
-                            "project": r["project"],
-                            "kind": r["kind"],
-                            "parent_id": r["parent_id"]
-                        },
+                        "meta": meta_dict,
                         "score": r["score"]
                     })
     except Exception as e:
@@ -243,7 +277,12 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
 
     # 3. Group by canonical source
     def get_parent_id(meta):
-        return meta.get("parent_id") or meta.get("shortcode") or meta.get("source") or meta.get("id")
+        # save_memory yozuvlarida parent_id yo'q, source="save_memory" — source ham tekshiriladi,
+        # aks holda BARCHA xotiralar bitta guruhga birlashib, faqat bittasi natijaga chiqardi.
+        pid = meta.get("parent_id") or meta.get("shortcode") or meta.get("source")
+        if not pid or pid in ("save_memory", "upload", "web_search", "web_page"):
+            return meta.get("id")
+        return pid
 
     vec_grouped = {}
     vec_all = defaultdict(list)
@@ -342,7 +381,10 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
     related_candidates = []
 
     for c in combined:
-        if check_evidence(query, c["text"], q_tokens, constraints, term_weights):
+        title = ""
+        if c.get("meta") and isinstance(c["meta"], dict):
+            title = c["meta"].get("title", "")
+        if check_evidence(query, c["text"], q_tokens, constraints, term_weights, title=title):
             if len(final_results) < top_k:
                 final_results.append(c)
             else:
