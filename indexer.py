@@ -16,8 +16,7 @@ from pathlib import Path
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-import chromadb
-from db import flush_index
+from db import flush_index, get_collection
 
 DB_PATH = str(Path(__file__).parent / "kg_db")
 COLLECTION = "graphify"
@@ -60,8 +59,7 @@ def main():
     ap.add_argument("--prune", action="store_true", help="diskda yo'q fayllarni indeksdan o'chirish")
     args = ap.parse_args()
 
-    client = chromadb.PersistentClient(path=DB_PATH)
-    col = client.get_or_create_collection(COLLECTION, metadata={"hnsw:space": "cosine"})
+    col = get_collection()
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     total_chunks = 0

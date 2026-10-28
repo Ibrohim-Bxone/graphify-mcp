@@ -280,11 +280,11 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
     where = filters[0] if len(filters) == 1 else ({"$and": filters} if filters else None)
     if _col.count() == 0:
         return "Knowledge base is empty. Nothing indexed yet."
-    import search_core
+    import search_service
     import keyword_index
     kw_idx = keyword_index.get_index()
     
-    res = search_core.hybrid_search(
+    res = search_service.retrieve(
         query=query,
         top_k=top_k,
         where=where,
@@ -293,10 +293,9 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
         min_similarity=MIN_SIMILARITY
     )
     
-    if res["status"] == "insufficient_evidence":
-        return "Bu so'rov uchun yetarli mos dalil topilmadi."
-        
     out = []
+    if res["status"] == "insufficient_evidence":
+        out.append("Bu so'rov uchun yetarli mos dalil topilmadi. Quyidagi nomzodlar dalil emas; kerak bo'lsa sarlavhasi bilan qayta qidiring.")
     returned_tokens = 0
     for item in res["results"]:
         meta = item["meta"] or {}
@@ -339,7 +338,8 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
         out.append("\n".join(rel_lines))
         
     try:
-        _record_search_savings(where, returned_tokens)
+        if res["results"]:
+            _record_search_savings(where, returned_tokens)
     except Exception as err:
         print(f"[graphify] Statistika xatosi ({err}), o'tkazib yuborildi.", file=sys.stderr)
     if not out:

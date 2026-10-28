@@ -4,6 +4,47 @@ import search_core
 import keyword_index
 import yozuv
 
+
+@pytest.mark.parametrize("fts5", [True, False])
+def test_title_keyword_candidate_without_vector_hit(tmp_path, monkeypatch, fts5):
+    monkeypatch.setattr(keyword_index, "DB_PATH", tmp_path / "keywords.sqlite3")
+    if not fts5:
+        monkeypatch.setattr(keyword_index, "_check_fts5", lambda conn: False)
+    index = keyword_index.KeywordIndex()
+    text = "The gateway completed its independent execution check."
+    meta = {"title": "Yagona poller tasdiqlandi", "project": "fabrika",
+            "id": "mem_title", "source": "save_memory"}
+
+    class NoVectorHit:
+        metadata = {"hnsw:space": "cosine"}
+
+        def count(self):
+            return 1
+
+        def query(self, **kwargs):
+            return {"ids": [[]]}
+
+        def get(self, ids, include):
+            return {"ids": ["mem_title"], "metadatas": [meta], "documents": [text]}
+
+    try:
+        index.upsert(["mem_title"], [text], [meta])
+        hits = index.search("yagona poller", filters={"project": "fabrika"})
+        assert [hit["id"] for hit in hits] == ["mem_title"]
+        assert hits[0]["text"] == text
+        assert index.search("yagona poller", filters={"project": "other"}) == []
+        result = search_core.hybrid_search(query="yagona poller", collection=NoVectorHit(), kw_index=index,
+                                           top_k=5, where={"project": "fabrika"})
+        assert result["status"] == "ok"
+        assert result["results"][0]["text"] == text
+        assert result["results"][0]["meta"]["title"] == meta["title"]
+        unrelated = search_core.hybrid_search(query="banan pishirish retsepti", collection=NoVectorHit(), kw_index=index,
+                                              top_k=5, where=None)
+        assert unrelated["status"] == "insufficient_evidence"
+    finally:
+        index.conn.close()
+
+
 def test_search_sarlavha_va_qoshimchalar(temp_yozuv):
     col, db_dir = temp_yozuv
     fts = keyword_index.get_index()

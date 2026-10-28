@@ -20,10 +20,16 @@ def _check_unit_length(collection):
     if cache_key is not None and cache_key in _unit_length_cache:
         return _unit_length_cache[cache_key]
 
+    raw_col = collection
+    db = sys.modules.get("db")
+    if db is not None and collection is getattr(db, "col", None):
+        raw_col = db.get_collection()
     try:
-        res = collection.get(limit=5, include=["embeddings"])
+        res = raw_col.get(limit=5, include=["embeddings"])
         embeddings = res.get("embeddings")
-        if not embeddings:
+        if embeddings is None or len(embeddings) == 0:
+            if cache_key is not None:
+                _unit_length_cache[cache_key] = True
             return True
         
         for vec in embeddings:
@@ -40,6 +46,8 @@ def _check_unit_length(collection):
             _unit_length_cache[cache_key] = True
         return True
     except Exception:
+        if cache_key is not None:
+            _unit_length_cache[cache_key] = True
         return True
 
 def distance_to_similarity(distance: float, space: str, *, query_vec=None, doc_vec=None) -> tuple[float, float]:

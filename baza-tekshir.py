@@ -18,6 +18,9 @@ import sys
 import time
 from datetime import datetime
 
+if os.environ.get("GRAPHIFY_STORAGE_MODE", "local") != "local":
+    raise RuntimeError("OFFLINE_ONLY: Server rejimi faol yoki noma'lum. Bu vosita faqat server to'xtatilgan lokal bazada ishlaydi.")
+
 # Windows konsolida UTF-8 chiqishini ta'minlash
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:

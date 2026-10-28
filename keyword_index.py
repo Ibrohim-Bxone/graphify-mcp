@@ -1,4 +1,5 @@
 import sqlite3
+import os
 import re
 import sys
 import math
@@ -6,7 +7,7 @@ from pathlib import Path
 from collections import Counter
 import argparse
 
-DB_PATH = Path(__file__).parent / "kg_db" / "keyword_index.sqlite3"
+DB_PATH = Path(os.environ.get("GRAPHIFY_DB_PATH", str(Path(__file__).parent / "kg_db"))) / "keyword_index.sqlite3"
 
 def normalize_text(text: str) -> str:
     text = text.lower()
@@ -122,7 +123,7 @@ class KeywordIndex:
                     self.conn.execute("DELETE FROM py_term_freqs WHERE doc_id = ?", (doc_id,))
 
                 # Insert new
-                tokens = tokenize(text)
+                tokens = tokenize((meta.get("title") or "") + "\n" + text)
                 token_count = len(tokens)
                 
                 self.conn.execute(
@@ -298,9 +299,8 @@ def rebuild():
     import yozuv
     with yozuv.lock():
         print("Kalit so'z indeksini qayta qurish (bu biroz vaqt olishi mumkin)...")
-        import chromadb
-        client = chromadb.PersistentClient(path=str(DB_PATH.parent.parent / "kg_db"))
-        col = client.get_collection("graphify")
+        from db import get_collection
+        col = get_collection()
         
         idx = KeywordIndex()
         with idx.conn:

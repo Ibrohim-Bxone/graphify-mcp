@@ -54,8 +54,9 @@ def test_make_scorer_unit():
     sim, raw_sim = scorer(1.0)
     assert np.isclose(raw_sim, 0.5)
 
-def test_make_scorer_non_unit():
-    col = MockCollection("l2", embeddings=[np.array([2, 0]), np.array([0, 2])])
+@pytest.mark.parametrize("embeddings", [[[2, 0], [0, 2]], np.array([[2, 0], [0, 2]])])
+def test_make_scorer_non_unit(embeddings):
+    col = MockCollection("l2", embeddings=embeddings)
     scorer = make_scorer(col)
     
     # Query / doc kiritmasak ValueError otishi kerak

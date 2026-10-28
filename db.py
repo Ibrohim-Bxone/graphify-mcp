@@ -6,6 +6,7 @@ o'zgarishidan aniqlanadi (diskni ortiqcha yuklamaslik uchun TTL bilan keshlangan
 """
 
 import functools
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,23 @@ import chromadb
 from chromadb.api.client import SharedSystemClient
 from embedders import build_chroma_embedding_function
 
-DB_PATH = str(Path(__file__).parent / "kg_db")
+STORAGE_MODE = os.environ.get("GRAPHIFY_STORAGE_MODE", "local")
+if STORAGE_MODE not in ("local", "http"):
+    raise ValueError("GRAPHIFY_STORAGE_MODE local yoki http bo'lishi kerak")
+DB_PATH = os.environ.get("GRAPHIFY_DB_PATH", str(Path(__file__).parent / "kg_db"))
+if STORAGE_MODE == "http":
+    CHROMA_HOST = os.environ.get("GRAPHIFY_CHROMA_HOST", "127.0.0.1")
+    if CHROMA_HOST == "localhost":
+        CHROMA_HOST = "127.0.0.1"
+    try:
+        if "%" in CHROMA_HOST or not ipaddress.ip_address(CHROMA_HOST).is_loopback:
+            raise ValueError
+    except ValueError:
+        raise ValueError("GRAPHIFY_CHROMA_HOST faqat loopback IP bo'lishi kerak") from None
+    port = os.environ.get("GRAPHIFY_CHROMA_PORT", "8993")
+    if not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
+        raise ValueError("GRAPHIFY_CHROMA_PORT 1–65535 oralig'ida bo'lishi kerak")
+    CHROMA_PORT = int(port)
 COLLECTION = "graphify"
 MTIME_CHECK_TTL = 2.0  # soniya: disk mtime tekshiruvini keshlaydigan vaqt oralig'i
 
@@ -29,6 +46,8 @@ _last_check_time = 0.0
 
 def get_db_mtime() -> float:
     """kg_db ichidagi SQLite fayllarining (chroma.sqlite3 va chroma.sqlite3-wal) eng katta mtime qiymatini qaytaradi."""
+    if STORAGE_MODE == "http":
+        return 0.0
     mtimes = []
     sqlite_file = Path(DB_PATH) / "chroma.sqlite3"
     if sqlite_file.exists():
@@ -72,6 +91,11 @@ def _open_collection(client):
 def reopen():
     """Tashqi jarayon bazaga yozganda yoki kesh eskirganda klient va kolleksiyani qayta ochadi."""
     global _client, _col, _last_mtime, _last_check_time
+    if STORAGE_MODE == "http":
+        client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT, ssl=False)
+        collection = _open_collection(client)
+        _client, _col = client, collection
+        return _col
     if _client is not None:
         try:
             if hasattr(_client, "_system"):
@@ -101,6 +125,9 @@ def check_cache_freshness() -> None:
         reopen()
         return
 
+    if STORAGE_MODE == "http":
+        return
+
     if now - _last_check_time < MTIME_CHECK_TTL:
         return
 
@@ -113,12 +140,16 @@ def check_cache_freshness() -> None:
 def notify_write() -> None:
     """Joriy jarayon bazaga yozganidan so'ng mtime keshini yangilaydi."""
     global _last_mtime, _last_check_time
+    if STORAGE_MODE == "http":
+        return
     _last_mtime = get_db_mtime()
     _last_check_time = time.monotonic()
 
 
 def get_segment_seq_ids() -> tuple:
     """SQLite dan METADATA va VECTOR segmentlarining hozirgi max seq_id larini qaytaradi."""
+    if STORAGE_MODE == "http":
+        return None, None
     sqlite_file = Path(DB_PATH) / "chroma.sqlite3"
     if not sqlite_file.exists():
         return None, None
@@ -143,6 +174,8 @@ def get_segment_seq_ids() -> tuple:
 
 def get_sync_threshold() -> int:
     """Kolleksiyaning sync_threshold parametrini qaytaradi (sukut bo'yicha 1000)."""
+    if STORAGE_MODE == "http":
+        return 1000
     sqlite_file = Path(DB_PATH) / "chroma.sqlite3"
     if not sqlite_file.exists():
         return 1000
@@ -182,6 +215,8 @@ def flush_index(target_col=None) -> bool:
 
     Farq bo'lmasa (meta_seq <= vec_seq) — hech qanday upsert qilmaydi (0 ta ortiqcha amal).
     """
+    if STORAGE_MODE == "http":
+        return False  # Indeksni diskka yozish server zimmasida; lokal HNSW hiylasi ishlatilmaydi.
     meta_seq, vec_seq = get_segment_seq_ids()
     if meta_seq is None or vec_seq is None:
         return False

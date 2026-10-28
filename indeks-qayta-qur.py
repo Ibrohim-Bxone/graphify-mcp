@@ -11,6 +11,9 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+if os.environ.get("GRAPHIFY_STORAGE_MODE", "local") != "local":
+    raise RuntimeError("OFFLINE_ONLY: Server rejimi faol yoki noma'lum. Bu vosita faqat server to'xtatilgan lokal bazada ishlaydi.")
+
 ROOT = Path(__file__).resolve().parent.parent
 
 os.environ.setdefault("GRAPHIFY_DIR", str(ROOT / "Graphify"))

@@ -3,6 +3,7 @@ import math
 import sqlite3
 import sys
 from collections import defaultdict
+import search_policy
 
 # IDF-weighted coverage chegarasi: "yetarli dalil" deb topish uchun so'rov
 # og'irligining kamida shuncha ulushi hujjatda uchrashi kerak (0.8 = 80%).
@@ -135,12 +136,14 @@ def coverage_for_text(term_weights: dict[str, float], text: str) -> tuple[float,
     return matched_weight / total_weight, matched_terms
 
 def check_evidence(query: str, chunk_text: str, q_tokens: list[str],
-                    constraints: list[str], term_weights: dict[str, float], title: str = "") -> bool:
+                    constraints: list[str], term_weights: dict[str, float], title: str = "", date: str = "") -> bool:
     """So'rov va nomzod bo'yicha oldindan hisoblangan (bir martalik) qiymatlar
     bilan ishlaydi — kw_index'ga SQL so'rov QILMAYDI, chunki
     compute_query_term_weights allaqachon chaqiruvchida bir marta bajarilgan."""
     import keyword_index
     combined_text = chunk_text + (" " + title if title else "")
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}(?:T.*)?', str(date)):
+        combined_text += " " + str(date)  # Search date metadata; this does not verify time-sensitive claims.
     t_tokens = set(keyword_index.tokenize(combined_text))
 
     if len(q_tokens) == 1:
@@ -209,13 +212,15 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
             
             for i, doc_id in enumerate(res["ids"][0]):
                 sim, raw_sim = scorer(dists[i], query_vec=query_vec, doc_vec=embeds[i])
+                candidate_meta = dict(metas[i] or {}, id=doc_id)
                 # MIN_SIMILARITY threshold applied ONLY to vector candidates
                 # assuming MIN_SIMILARITY is usually imported, let's say 0.25 if not provided
-                if sim >= min_similarity:
+                if (sim >= min_similarity and search_policy.matches_where(candidate_meta, where)
+                        and search_policy.usable(candidate_meta, docs[i])):
                     vec_candidates.append({
                         "id": doc_id,
                         "text": docs[i],
-                        "meta": metas[i] or {},
+                        "meta": candidate_meta,
                         "sim": sim,
                         "raw_sim": raw_sim
                     })
@@ -264,6 +269,10 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
                     }
                     if r["id"] in exist_metas and exist_metas[r["id"]]:
                         meta_dict.update(exist_metas[r["id"]])
+                    meta_dict["id"] = r["id"]
+                    if (not search_policy.matches_where(meta_dict, where)
+                            or not search_policy.usable(meta_dict, r["text"])):
+                        continue
                     
                     kw_candidates.append({
                         "id": r["id"],
@@ -279,10 +288,7 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
     def get_parent_id(meta):
         # save_memory yozuvlarida parent_id yo'q, source="save_memory" — source ham tekshiriladi,
         # aks holda BARCHA xotiralar bitta guruhga birlashib, faqat bittasi natijaga chiqardi.
-        pid = meta.get("parent_id") or meta.get("shortcode") or meta.get("source")
-        if not pid or pid in ("save_memory", "upload", "web_search", "web_page"):
-            return meta.get("id")
-        return pid
+        return search_policy.source_key(meta)
 
     vec_grouped = {}
     vec_all = defaultdict(list)
@@ -318,6 +324,16 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
         rrf_scores[pid] += 1.0 / (RRF_K + rank + 1)
         
     # Combine results
+    import keyword_index as _kw_mod
+    q_tokens = _kw_mod.tokenize(query)
+    constraints = extract_strict_constraints(query)
+    term_weights = compute_query_term_weights(query, kw_index)
+
+    def evidence(candidate):
+        meta = candidate.get("meta") or {}
+        return check_evidence(query, candidate["text"], q_tokens, constraints, term_weights,
+                              title=meta.get("title", ""), date=meta.get("date", ""))
+
     combined = []
     for pid, rrf in rrf_scores.items():
         # kalit so'z indeksi faqat project/kind/parent_id saqlaydi
@@ -349,6 +365,10 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
             all_chunks_for_pid[c["id"]] = c
         for c in kw_all.get(pid, []):
             all_chunks_for_pid[c["id"]] = c
+
+        if not evidence(best_c):
+            # A generic vector representative must not hide an exact matching sibling chunk.
+            best_c = next((c for c in all_chunks_for_pid.values() if evidence(c)), best_c)
             
         if best_c["id"] in all_chunks_for_pid:
             del all_chunks_for_pid[best_c["id"]]
@@ -372,10 +392,6 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
     # shu yerda BIR MARTA hisoblanadi va har nomzodga uzatiladi — avval har
     # nomzod uchun qaytadan SQL bilan hisoblanardi (N nomzod x M termin so'rov,
     # ko'p natijali so'rovlarda soniyalab kechikish sababi edi).
-    import keyword_index as _kw_mod
-    q_tokens = _kw_mod.tokenize(query)
-    constraints = extract_strict_constraints(query)
-    term_weights = compute_query_term_weights(query, kw_index)
 
     final_results = []
     related_candidates = []
@@ -384,7 +400,7 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
         title = ""
         if c.get("meta") and isinstance(c["meta"], dict):
             title = c["meta"].get("title", "")
-        if check_evidence(query, c["text"], q_tokens, constraints, term_weights, title=title):
+        if evidence(c):
             if len(final_results) < top_k:
                 final_results.append(c)
             else:

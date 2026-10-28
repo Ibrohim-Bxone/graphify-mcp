@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 from contextlib import contextmanager
 
-DB_DIR = Path(__file__).parent / "kg_db"
+DB_DIR = Path(os.environ.get("GRAPHIFY_DB_PATH", str(Path(__file__).parent / "kg_db")))
 LOCK_FILE = DB_DIR / ".yozuv.lock"
 PENDING_FILE = DB_DIR / ".pending_fts.json"
 
