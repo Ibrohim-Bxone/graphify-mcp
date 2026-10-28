@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Build and synchronize Graphify v2 database (bge-m3 embeddings side-by-side).
 
-Reads v1 strictly via SQLite in read-only mode (file:...chroma.sqlite3?mode=ro),
+Reads v1 strictly via SQLite in read-only mode in one snapshot transaction,
+collection-scoped by segments, copies full metadata/configuration,
 embeds records with Ollama bge-m3, populates kg_db_v2 ChromaDB and keyword index,
-and verifies consistency against manifest.
+verifies ALL records and keyword index, and writes manifest + atomic build_complete.json.
 """
 
 import argparse
 import hashlib
 import json
 import os
-import random
 import sqlite3
 import subprocess
 import sys
@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from embedders import build_embedder
+from embedders import build_embedder, get_ollama_model_digest, build_chroma_embedding_function, ModelIdentityError
 
 BGE_M3_CONFIG = {
     "embedder_type": "ollama",
@@ -47,10 +47,22 @@ def compute_hashes(doc: str, meta: dict) -> tuple[str, str]:
     return doc_hash, meta_hash
 
 
-def read_v1_records(v1_dir: Path, limit: int | None = None) -> tuple[str, dict, float, list[dict]]:
-    """Read collection metadata and records from v1 via read-only SQLite.
+def compute_corpus_hash(records: list[dict]) -> str:
+    """Compute deterministic SHA-256 corpus hash across all record IDs and contents."""
+    hasher = hashlib.sha256()
+    for r in sorted(records, key=lambda x: str(x["id"])):
+        d_hash, m_hash = compute_hashes(r["document"], r["metadata"])
+        hasher.update(f"{r['id']}:{d_hash}:{m_hash}\n".encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def read_v1_records(
+    v1_dir: Path, limit: int | None = None, collection_name: str = "graphify"
+) -> tuple[str, dict, dict, float, list[dict]]:
+    """Read collection metadata, configuration, and records from v1 via read-only SQLite in one snapshot transaction.
 
     Never opens v1 via chromadb to prevent unintended writes or lock contention.
+    Includes documentless records (LEFT JOIN) and scopes strictly to collection segments.
     """
     v1_sqlite = v1_dir / "chroma.sqlite3"
     if not v1_sqlite.exists():
@@ -59,15 +71,21 @@ def read_v1_records(v1_dir: Path, limit: int | None = None) -> tuple[str, dict, 
     v1_mtime = v1_sqlite.stat().st_mtime
     uri = f"file:{v1_sqlite.as_posix()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=30.0)
+    conn.isolation_level = None
     try:
         cur = conn.cursor()
+        cur.execute("BEGIN")
 
-        # 1. Collection name and settings
-        cur.execute("SELECT id, name FROM collections LIMIT 1")
+        # 1. Collection name, config and settings
+        cur.execute(
+            "SELECT id, name, config_json_str FROM collections WHERE name = ? LIMIT 1",
+            (collection_name,),
+        )
         col_row = cur.fetchone()
         if not col_row:
-            raise RuntimeError("v1 bazasida kolleksiya topilmadi")
-        col_id, col_name = col_row
+            raise RuntimeError(f"v1 bazasida '{collection_name}' kolleksiyasi topilmadi")
+        col_id, col_name, config_json_str = col_row
+        col_config = json.loads(config_json_str) if config_json_str else {}
 
         cur.execute(
             "SELECT key, str_value, int_value, float_value, bool_value "
@@ -85,20 +103,25 @@ def read_v1_records(v1_dir: Path, limit: int | None = None) -> tuple[str, dict, 
             elif s is not None:
                 col_meta[k] = s
 
-        # 2. Fetch document texts and IDs
+        # 2. Fetch document texts and IDs scoped by collection segments (including documentless records)
         query = (
             "SELECT e.id, e.embedding_id, f.c0 "
             "FROM embeddings e "
-            "JOIN embedding_fulltext_search_content f ON e.id = f.id "
+            "LEFT JOIN embedding_fulltext_search_content f ON e.id = f.id "
+            "WHERE e.segment_id IN ("
+            "    SELECT s.id FROM segments s "
+            "    JOIN collections c ON s.collection = c.id "
+            "    WHERE c.name = ?"
+            ") "
             "ORDER BY e.id"
         )
         if limit is not None and limit > 0:
             query += f" LIMIT {limit}"
-        cur.execute(query)
+        cur.execute(query, (col_name,))
         doc_rows = cur.fetchall()
 
         if not doc_rows:
-            return col_name, col_meta, v1_mtime, []
+            return col_name, col_meta, col_config, v1_mtime, []
 
         row_ids = [r[0] for r in doc_rows]
         min_id, max_id = min(row_ids), max(row_ids)
@@ -131,10 +154,10 @@ def read_v1_records(v1_dir: Path, limit: int | None = None) -> tuple[str, dict, 
         for rid, emb_id, doc in doc_rows:
             records.append({
                 "id": emb_id,
-                "document": doc,
+                "document": doc if doc is not None else "",
                 "metadata": meta_by_id.get(rid, {}),
             })
-        return col_name, col_meta, v1_mtime, records
+        return col_name, col_meta, col_config, v1_mtime, records
     finally:
         conn.close()
 
@@ -170,6 +193,7 @@ def rebuild_keyword_index_subprocess(out_dir: Path) -> None:
     """Run keyword_index.rebuild() in an isolated subprocess with GRAPHIFY_DB_PATH set to out_dir."""
     env = dict(os.environ)
     env["GRAPHIFY_DB_PATH"] = str(out_dir.resolve())
+    env["GRAPHIFY_STORAGE_MODE"] = "local"
     cmd = [
         sys.executable,
         "-c",
@@ -183,48 +207,110 @@ def rebuild_keyword_index_subprocess(out_dir: Path) -> None:
     print("[keyword_index] Muvaffaqiyatli qayta qurildi.", flush=True)
 
 
-def verify_v2(col, records: list[dict], manifest_path: Path, expected_count: int) -> None:
-    """Verify record counts, manifest IDs, and sample documents/metadata."""
+def verify_v2(col, records: list[dict], out_dir: Path) -> None:
+    """Verify ALL record counts, IDs, documents, metadatas, and keyword index content."""
     v2_count = col.count()
+    expected_count = len(records)
     if v2_count != expected_count:
         raise AssertionError(f"Kolleksiya soni mos kelmadi: v2={v2_count}, kutilgan={expected_count}")
 
-    # Verify all manifest IDs are present
-    manifest_ids = set()
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                item = json.loads(line)
-                manifest_ids.add(item["id"])
+    v1_map = {r["id"]: r for r in records}
+    dest_data = col.get(include=["documents", "metadatas"])
+    dest_ids = set(dest_data["ids"])
 
-    existing_v2_ids = set(col.get(include=[])["ids"])
-    missing_in_v2 = manifest_ids - existing_v2_ids
+    missing_in_v2 = set(v1_map.keys()) - dest_ids
     if missing_in_v2:
-        raise AssertionError(f"Manifestdagi {len(missing_in_v2)} ta ID v2 kolleksiyasida topilmadi: {list(missing_in_v2)[:5]}")
+        raise AssertionError(f"v2 da {len(missing_in_v2)} ta ID topilmadi: {list(missing_in_v2)[:5]}")
+    extra_in_v2 = dest_ids - set(v1_map.keys())
+    if extra_in_v2:
+        raise AssertionError(f"v2 da ortiqcha {len(extra_in_v2)} ta ID mavjud: {list(extra_in_v2)[:5]}")
 
-    # Random 20 checks
-    sample_size = min(20, len(records))
-    samples = random.sample(records, sample_size) if sample_size > 0 else []
-    for s in samples:
-        res = col.get(ids=[s["id"]], include=["documents", "metadatas"])
-        if not res["ids"]:
-            raise AssertionError(f"Namunaviy ID v2 da topilmadi: {s['id']}")
-        v2_doc = res["documents"][0]
-        v2_meta = res["metadatas"][0] or {}
-        if v2_doc != s["document"]:
-            raise AssertionError(f"Hujjat matni mos kelmadi (ID={s['id']}): v1={s['document'][:50]} vs v2={v2_doc[:50]}")
-        if v2_meta != s["metadata"]:
-            raise AssertionError(f"Metadata mos kelmadi (ID={s['id']}): v1={s['metadata']} vs v2={v2_meta}")
+    # Verify document text and metadata for all records
+    for did, doc, meta in zip(dest_data["ids"], dest_data["documents"], dest_data["metadatas"]):
+        expected = v1_map[did]
+        if (doc or "") != (expected["document"] or ""):
+            raise AssertionError(f"Hujjat matni mos kelmadi (ID={did})")
+        if (meta or {}) != (expected["metadata"] or {}):
+            raise AssertionError(f"Metadata mos kelmadi (ID={did})")
+
+    # Verify keyword index content
+    kw_sqlite = out_dir / "keyword_index.sqlite3"
+    if not kw_sqlite.exists():
+        raise AssertionError(f"Keyword index fayli topilmadi: {kw_sqlite}")
+
+    from keyword_index import tokenize
+    kw_conn = sqlite3.connect(str(kw_sqlite), timeout=10.0)
+    try:
+        kw_cur = kw_conn.cursor()
+        kw_cur.execute("SELECT id, project, kind, parent_id, token_count, text FROM docs")
+        doc_rows = kw_cur.fetchall()
+        if len(doc_rows) != len(records):
+            raise AssertionError(f"Keyword index 'docs' qatorlar soni mos kelmadi: {len(doc_rows)} != {len(records)}")
+
+        doc_by_id = {r[0]: r for r in doc_rows}
+        for r in records:
+            rid = r["id"]
+            if rid not in doc_by_id:
+                raise AssertionError(f"Keyword index 'docs' da ID topilmadi: {rid}")
+            _, proj, kind, parent, t_cnt, txt = doc_by_id[rid]
+            exp_txt = r["document"] or ""
+            if (txt or "") != exp_txt:
+                raise AssertionError(f"Keyword index 'docs' matni mos kelmadi: ID={rid}")
+            meta = r["metadata"] or {}
+            exp_proj = meta.get("project", "")
+            exp_kind = meta.get("kind", "")
+            exp_parent = meta.get("parent_id", "")
+            if not exp_parent and "shortcode" in meta:
+                exp_parent = meta["shortcode"]
+            if not exp_parent and "source" in meta:
+                exp_parent = meta["source"]
+            if proj != exp_proj:
+                raise AssertionError(f"Keyword index 'docs' project mos kelmadi: ID={rid} ({proj} != {exp_proj})")
+            if kind != exp_kind:
+                raise AssertionError(f"Keyword index 'docs' kind mos kelmadi: ID={rid} ({kind} != {exp_kind})")
+            if parent != exp_parent:
+                raise AssertionError(f"Keyword index 'docs' parent_id mos kelmadi: ID={rid} ({parent} != {exp_parent})")
+            exp_tokens = tokenize((meta.get("title") or "") + "\n" + exp_txt)
+            if t_cnt != len(exp_tokens):
+                raise AssertionError(f"Keyword index 'docs' token_count mos kelmadi: ID={rid} ({t_cnt} != {len(exp_tokens)})")
+
+        kw_cur.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fts_idx'")
+        if kw_cur.fetchone()[0] > 0:
+            kw_cur.execute("SELECT id, text FROM fts_idx")
+            fts_rows = kw_cur.fetchall()
+            if len(fts_rows) != len(records):
+                raise AssertionError(f"Keyword index 'fts_idx' qatorlar soni mos kelmadi: {len(fts_rows)} != {len(records)}")
+            fts_by_id = {r[0]: r[1] for r in fts_rows}
+            for r in records:
+                rid = r["id"]
+                if rid not in fts_by_id:
+                    raise AssertionError(f"Keyword index 'fts_idx' da ID topilmadi: {rid}")
+                meta = r["metadata"] or {}
+                exp_tokens = tokenize((meta.get("title") or "") + "\n" + (r["document"] or ""))
+                exp_fts = " ".join(exp_tokens)
+                if fts_by_id[rid] != exp_fts:
+                    raise AssertionError(f"Keyword index 'fts_idx' matni mos kelmadi: ID={rid}")
+    finally:
+        kw_conn.close()
 
     print(
-        f"[verify] Tekshiruv muvaffaqiyatli: {v2_count} ta yozuv, barcha manifest ID mavjud, "
-        f"{sample_size} ta tasodifiy namuna 100% mos.",
+        f"[verify] Tekshiruv muvaffaqiyatli: barcha {v2_count} ta yozuv 100% mos, "
+        f"keyword index ({len(doc_rows)} ta hujjat) tasdiqlandi.",
         flush=True,
     )
 
 
-def write_manifest_and_info(out_dir: Path, records: list[dict], v1_mtime: float, started_at: datetime) -> None:
-    """Write manifest.jsonl and build_info.json."""
+def write_manifest_and_identity(
+    out_dir: Path,
+    records: list[dict],
+    v1_mtime: float,
+    started_at: datetime,
+    model_digest: str,
+    distance: str,
+    corpus_hash: str,
+    kw_gen: str,
+) -> dict:
+    """Write manifest.jsonl and graphify_manifest.json with complete model identity."""
     manifest_path = out_dir / "manifest.jsonl"
     with open(manifest_path, "w", encoding="utf-8") as f:
         for r in records:
@@ -236,63 +322,127 @@ def write_manifest_and_info(out_dir: Path, records: list[dict], v1_mtime: float,
             }
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-    # Source counts
-    sources = Counter()
-    for r in records:
-        m = r.get("metadata", {})
-        origin = m.get("origin") or m.get("source") or "unknown"
-        if "instagram.com" in str(origin):
-            origin = "instagram"
-        sources[origin] += 1
-
-    completed_at = datetime.now(timezone.utc)
-    build_info = {
-        "source_counts": dict(sources),
-        "total_records": len(records),
+    identity = {
+        "schema_version": 2,
+        "backend": "ollama",
         "model": "bge-m3",
+        "model_digest": model_digest,
         "dimension": EXPECTED_DIMENSION,
-        "timestamps": {
-            "started_at": started_at.isoformat(),
-            "completed_at": completed_at.isoformat(),
-            "duration_seconds": round((completed_at - started_at).total_seconds(), 2),
-        },
+        "distance": distance,
+        "normalization": False,
+        "corpus_hash": corpus_hash,
+        "keyword_index_generation": kw_gen,
+        "total_records": len(records),
         "v1_sqlite_mtime": v1_mtime,
     }
-    with open(out_dir / "build_info.json", "w", encoding="utf-8") as f:
-        json.dump(build_info, f, indent=2, ensure_ascii=False)
+    with open(out_dir / "graphify_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(identity, f, indent=2, ensure_ascii=False)
+
+    return identity
+
+
+def write_build_complete_atomic(out_dir: Path, identity: dict, started_at) -> None:
+    """Atomically write build_complete.json only after verification and keyword rebuild succeed."""
+    completed_at = datetime.now(timezone.utc)
+    started_dt = (
+        started_at
+        if isinstance(started_at, datetime)
+        else datetime.fromtimestamp(float(started_at), tz=timezone.utc)
+    )
+    complete_info = dict(identity)
+    complete_info["timestamps"] = {
+        "started_at": started_dt.isoformat(),
+        "completed_at": completed_at.isoformat(),
+        "duration_seconds": round((completed_at - started_dt).total_seconds(), 2),
+    }
+    tmp_path = out_dir / "build_complete.json.tmp"
+    final_path = out_dir / "build_complete.json"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(complete_info, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, final_path)
 
 
 def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int = 8) -> None:
-    """Compare current v1 against manifest, upsert new/changed ids, delete removed ids."""
-    manifest_path = out_dir / "manifest.jsonl"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Manifest topilmadi ({manifest_path}). Avval to'liq build yarating.")
+    """Compare destination document+metadata hashes, re-embed/upsert changed ids, delete removed ids.
+
+    Verifies ALL records and keyword index content; writes build_complete.json atomically
+    only after keyword rebuild succeeds. An unchanged retry does not return early with a broken index.
+    """
+    if out_dir.resolve() == v1_dir.resolve():
+        raise ValueError(f"Chiqish yo'li v1 manbasi bilan bir xil bo'lishi mumkin emas: {out_dir}")
 
     started_at = datetime.now(timezone.utc)
-    print(f"[sync] Manifest yuklanmoqda: {manifest_path}...", flush=True)
-    manifest = {}
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                item = json.loads(line)
-                manifest[item["id"]] = item
-
-    col_name, col_meta, v1_mtime, v1_records = read_v1_records(v1_dir)
+    print(f"[sync] v1 o'qilmoqda: {v1_dir}...", flush=True)
+    col_name, col_meta, col_config, v1_mtime, v1_records = read_v1_records(v1_dir)
     v1_map = {r["id"]: r for r in v1_records}
+    corpus_hash = compute_corpus_hash(v1_records)
+
+    # Strictly validate model identity before ANY mutation (Finding 2 & 6)
+    model_digest = get_ollama_model_digest(
+        BGE_M3_CONFIG["config"]["ollama"]["base_url"],
+        BGE_M3_CONFIG["config"]["ollama"]["model"],
+    )
+    manifest_file = out_dir / "graphify_manifest.json"
+    if manifest_file.exists():
+        try:
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                m_exist = json.load(f)
+            if (
+                m_exist.get("model") != "bge-m3"
+                or m_exist.get("model_digest") != model_digest
+                or int(m_exist.get("dimension", 0)) != EXPECTED_DIMENSION
+            ):
+                raise ModelIdentityError(
+                    f"Sync rad etildi: mavjud v2 identity ({m_exist.get('model')}, {m_exist.get('model_digest')}) "
+                    f"joriy modelga mos kelmadi (bge-m3, {model_digest})!"
+                )
+        except ModelIdentityError:
+            raise
+        except Exception:
+            pass
+
+    space = col_meta.get("hnsw:space", "l2")
+    sync_identity = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": model_digest,
+        "dimension": EXPECTED_DIMENSION,
+        "distance": space,
+    }
+
+    import chromadb
+
+    client = chromadb.PersistentClient(path=str(out_dir))
+    embed_fn = build_chroma_embedding_function(identity=sync_identity)
+    col = client.get_or_create_collection(
+        name=col_name,
+        metadata={"hnsw:space": space},
+        embedding_function=embed_fn,
+    )
+
+    # Fetch destination records to compare hashes
+    dest_data = col.get(include=["documents", "metadatas"])
+    dest_map = {}
+    for did, doc, meta in zip(dest_data["ids"], dest_data["documents"], dest_data["metadatas"]):
+        dest_map[did] = (doc, meta)
 
     to_upsert = []
     unchanged = 0
     for r in v1_records:
         rid = r["id"]
         d_hash, m_hash = compute_hashes(r["document"], r["metadata"])
-        if rid not in manifest:
-            to_upsert.append(r)
-        elif manifest[rid]["doc_sha256"] != d_hash or manifest[rid]["meta_sha256"] != m_hash:
+        if rid not in dest_map:
             to_upsert.append(r)
         else:
-            unchanged += 1
+            dest_doc, dest_meta = dest_map[rid]
+            cur_d_hash, cur_m_hash = compute_hashes(dest_doc, dest_meta)
+            if cur_d_hash != d_hash or cur_m_hash != m_hash:
+                to_upsert.append(r)
+            else:
+                unchanged += 1
 
-    to_delete = [mid for mid in manifest if mid not in v1_map]
+    to_delete = [did for did in dest_map if did not in v1_map]
 
     print(
         f"[sync] Reja: {len(to_upsert)} ta yangilash/qo'shish, {len(to_delete)} ta o'chirish, "
@@ -300,17 +450,43 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         flush=True,
     )
 
-    if not to_upsert and not to_delete:
-        print("[sync] Baza allaqachon to'liq sinxron holatda.", flush=True)
-        return
+    complete_file = out_dir / "build_complete.json"
+    kw_sqlite = out_dir / "keyword_index.sqlite3"
+    needs_rebuild = bool(to_upsert or to_delete or not complete_file.exists() or not kw_sqlite.exists() or not manifest_file.exists())
 
-    import chromadb
+    if not needs_rebuild:
+        try:
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                m_check = json.load(f)
+            with open(complete_file, "r", encoding="utf-8") as f:
+                c_check = json.load(f)
+            kw_mtime_gen = str(int(kw_sqlite.stat().st_mtime))
+            if (
+                m_check.get("corpus_hash") != corpus_hash
+                or m_check.get("total_records") != len(v1_records)
+                or m_check.get("model_digest") != model_digest
+                or m_check.get("keyword_index_generation") != kw_mtime_gen
+                or c_check.get("corpus_hash") != corpus_hash
+                or c_check.get("keyword_index_generation") != kw_mtime_gen
+            ):
+                needs_rebuild = True
+        except Exception:
+            needs_rebuild = True
 
-    client = chromadb.PersistentClient(path=str(out_dir))
-    col = client.get_or_create_collection(
-        name=col_name,
-        metadata={"hnsw:space": col_meta.get("hnsw:space", "l2")},
-    )
+    if not to_upsert and not to_delete and not needs_rebuild:
+        try:
+            verify_v2(col, v1_records, out_dir)
+            print("[sync] Baza allaqachon to'liq sinxron holatda va tasdiqlangan.", flush=True)
+            return
+        except Exception:
+            needs_rebuild = True
+
+    # Invalidate completion status before mutations so interrupted sync cannot leave broken state (Finding 4)
+    if complete_file.exists():
+        try:
+            complete_file.unlink()
+        except OSError:
+            pass
 
     if to_delete:
         print(f"[sync] {len(to_delete)} ta yozuv o'chirilmoqda...", flush=True)
@@ -323,7 +499,7 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
             chunk = to_upsert[i : i + batch_size]
             docs = [c["document"] for c in chunk]
             ids = [c["id"] for c in chunk]
-            metas = [c["metadata"] for c in chunk]
+            metas = [c["metadata"] if c.get("metadata") else None for c in chunk]
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 embeddings = list(
@@ -333,15 +509,32 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
             col.upsert(ids=ids, documents=docs, metadatas=metas, embeddings=embeddings)
             print(f"[sync] {min(i + batch_size, len(to_upsert))}/{len(to_upsert)} yangilandi...", flush=True)
 
-    # Rewrite manifest & info
-    write_manifest_and_info(out_dir, v1_records, v1_mtime, started_at)
-
     # Rebuild keyword index
     rebuild_keyword_index_subprocess(out_dir)
 
-    # Verify
-    verify_v2(col, v1_records, manifest_path, len(v1_records))
-    print("[sync] Sinxronizatsiya yakunlandi.", flush=True)
+    # Verify ALL records and keyword index content
+    verify_v2(col, v1_records, out_dir)
+
+    kw_gen = str(int(kw_sqlite.stat().st_mtime)) if kw_sqlite.exists() else "gen1"
+
+    # Write manifest and identity
+    identity = write_manifest_and_identity(
+        out_dir=out_dir,
+        records=v1_records,
+        v1_mtime=v1_mtime,
+        started_at=started_at,
+        model_digest=model_digest,
+        distance=space,
+        corpus_hash=corpus_hash,
+        kw_gen=kw_gen,
+    )
+
+    # Update collection metadata in ChromaDB (Finding 5)
+    col.modify(metadata=identity)
+
+    # Write build_complete.json atomically
+    write_build_complete_atomic(out_dir, identity, started_at)
+    print("[sync] Sinxronizatsiya muvaffaqiyatli yakunlandi.", flush=True)
 
 
 def main():
@@ -362,6 +555,10 @@ def main():
     else:
         out_dir = Path("kg_db_v2")
 
+    # Finding 1: reject --out that resolves to source
+    if out_dir.resolve() == v1_dir.resolve():
+        raise ValueError(f"Chiqish yo'li v1 manbasi bilan bir xil bo'lishi mumkin emas: out={out_dir}, v1={v1_dir}")
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.sync:
@@ -375,8 +572,8 @@ def main():
         flush=True,
     )
 
-    # 1. Read v1 via read-only SQLite
-    col_name, col_meta, v1_mtime, records = read_v1_records(v1_dir, limit=limit)
+    # 1. Read v1 via read-only SQLite in snapshot transaction
+    col_name, col_meta, col_config, v1_mtime, records = read_v1_records(v1_dir, limit=limit)
     print(
         f"[build_v2] v1 o'qildi: kolleksiya='{col_name}', meta={col_meta}, yozuvlar={len(records)}.",
         flush=True,
@@ -385,18 +582,71 @@ def main():
         print("[build_v2] Yozuvlar topilmadi, to'xtatildi.", flush=True)
         return
 
-    # 2. Setup v2 ChromaDB
+    corpus_hash = compute_corpus_hash(records)
+
+    # 2. Setup v2 ChromaDB copying full collection metadata and configuration + identity
     import chromadb
 
     client = chromadb.PersistentClient(path=str(out_dir))
     space = col_meta.get("hnsw:space", "l2")
-    col = client.get_or_create_collection(name=col_name, metadata={"hnsw:space": space})
 
-    # Resumable: find already processed IDs in v2
-    existing_ids = set(col.get(include=[])["ids"])
-    pending = [r for r in records if r["id"] not in existing_ids]
+    # Fetch model digest without falling back to unknown (Finding 6)
+    model_digest = get_ollama_model_digest(
+        BGE_M3_CONFIG["config"]["ollama"]["base_url"],
+        BGE_M3_CONFIG["config"]["ollama"]["model"],
+    )
+
+    merged_metadata = dict(col_meta)
+    merged_metadata.update({
+        "hnsw:space": space,
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": model_digest,
+        "dimension": EXPECTED_DIMENSION,
+        "distance": space,
+        "normalization": False,
+        "corpus_hash": corpus_hash,
+    })
+
+    embed_fn = build_chroma_embedding_function(identity=merged_metadata)
+    col = client.get_or_create_collection(
+        name=col_name,
+        metadata=merged_metadata,
+        configuration=col_config,
+        embedding_function=embed_fn,
+    )
+
+    # Resumable: compare destination document+metadata hashes, do not skip changed ids!
+    dest_data = col.get(include=["documents", "metadatas"])
+    dest_map = {}
+    for did, doc, meta in zip(dest_data["ids"], dest_data["documents"], dest_data["metadatas"]):
+        dest_map[did] = (doc, meta)
+
+    # Finding 14: Delete removed destination records on resume/build
+    records_map = {r["id"]: r for r in records}
+    to_delete = [did for did in dest_map if did not in records_map]
+    if to_delete:
+        print(f"[build_v2] Manbadan o'chirilgan {len(to_delete)} ta yozuv v2 dan o'chirilmoqda...", flush=True)
+        col.delete(ids=to_delete)
+        for did in to_delete:
+            dest_map.pop(did, None)
+
+    pending = []
+    for r in records:
+        rid = r["id"]
+        d_hash, m_hash = compute_hashes(r["document"], r["metadata"])
+        if rid not in dest_map:
+            pending.append(r)
+        else:
+            dest_doc, dest_meta = dest_map[rid]
+            cur_d_hash, cur_m_hash = compute_hashes(dest_doc, dest_meta)
+            if cur_d_hash != d_hash or cur_m_hash != m_hash:
+                pending.append(r)
+
     print(
-        f"[build_v2] Mavjud yozuvlar: {len(existing_ids)}, qolgan kutilayotgan: {len(pending)}.",
+        f"[build_v2] Mavjud to'g'ri yozuvlar: {len(dest_map) - (len(pending) - (len(records) - len(dest_map)))}, "
+        f"kutilayotgan/o'zgargan: {len(pending)}.",
         flush=True,
     )
 
@@ -413,7 +663,7 @@ def main():
             chunk = pending[i : i + args.batch_size]
             docs = [c["document"] for c in chunk]
             ids = [c["id"] for c in chunk]
-            metas = [c["metadata"] for c in chunk]
+            metas = [c["metadata"] if c.get("metadata") else None for c in chunk]
 
             with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
                 embeddings = list(
@@ -427,15 +677,33 @@ def main():
                 flush=True,
             )
 
-    # 4. Write manifest and build_info
-    print("[build_v2] Manifest va build_info.json yozilmoqda...", flush=True)
-    write_manifest_and_info(out_dir, records, v1_mtime, started_at)
-
-    # 5. Rebuild keyword index
+    # 4. Rebuild keyword index
     rebuild_keyword_index_subprocess(out_dir)
 
-    # 6. Verify
-    verify_v2(col, records, out_dir / "manifest.jsonl", len(records))
+    # 5. Verify ALL records and keyword index content
+    verify_v2(col, records, out_dir)
+
+    kw_sqlite = out_dir / "keyword_index.sqlite3"
+    kw_gen = str(int(kw_sqlite.stat().st_mtime)) if kw_sqlite.exists() else "gen1"
+
+    # 6. Write manifest and identity
+    print("[build_v2] Manifest va graphify_manifest.json yozilmoqda...", flush=True)
+    identity = write_manifest_and_identity(
+        out_dir=out_dir,
+        records=records,
+        v1_mtime=v1_mtime,
+        started_at=started_at,
+        model_digest=model_digest,
+        distance=space,
+        corpus_hash=corpus_hash,
+        kw_gen=kw_gen,
+    )
+
+    # Update collection metadata in ChromaDB (Finding 5)
+    col.modify(metadata=identity)
+
+    # 7. Write build_complete.json atomically
+    write_build_complete_atomic(out_dir, identity, started_at)
     print("[build_v2] Jarayon muvaffaqiyatli yakunlandi!", flush=True)
 
 

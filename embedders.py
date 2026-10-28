@@ -18,6 +18,7 @@ it refuses to silently corrupt an existing collection.
 """
 
 import json
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -203,15 +204,130 @@ class _ChromaEmbeddingFunctionAdapter:
         return f"graphify-{self._backend_name}"
 
 
-def build_chroma_embedding_function(cfg: dict = None):
+class ModelIdentityError(Exception):
+    """Raised when database model identity validation fails (fails closed, no fallback)."""
+    pass
+
+
+def get_ollama_model_digest(base_url: str = "http://localhost:11434", model: str = "bge-m3") -> str:
+    """Fetch model digest from Ollama /api/tags or /api/show."""
+    import urllib.request
+    
+    url_base = (base_url or "http://localhost:11434").rstrip("/")
+    target_tag = model if ":" in model else f"{model}:latest"
+    try:
+        req = urllib.request.Request(f"{url_base}/api/tags", headers={"User-Agent": "graphify"})
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for m in data.get("models", []):
+            m_name = m.get("name", "")
+            m_model = m.get("model", "")
+            m_name_norm = m_name if ":" in m_name else (f"{m_name}:latest" if m_name else "")
+            m_model_norm = m_model if ":" in m_model else (f"{m_model}:latest" if m_model else "")
+            if m_name_norm == target_tag or m_model_norm == target_tag:
+                digest = m.get("digest")
+                if digest:
+                    return digest
+    except Exception as e:
+        try:
+            body = json.dumps({"model": target_tag}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{url_base}/api/show",
+                data=body,
+                headers={"Content-Type": "application/json", "User-Agent": "graphify"},
+            )
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            digest = data.get("details", {}).get("digest") or data.get("digest")
+            if digest:
+                return digest
+        except Exception:
+            raise ModelIdentityError(f"Ollama serveriga ulanib bo'lmadi yoki model topilmadi ({model}): {e}") from e
+        raise ModelIdentityError(f"Ollama model digest topilmadi: {model}") from e
+    raise ModelIdentityError(f"Ollama model '{model}' /api/tags da topilmadi")
+
+
+def build_identity_embedder(identity: dict, base_url: str = None) -> EmbedderBase:
+    """Instantiate and strictly validate the embedder required by database identity.
+
+    Fails closed: on mismatch (model name, digest or dimension), missing Ollama,
+    or a failed 1-query self-test -> raises ModelIdentityError, never falls back.
+    """
+    backend = identity.get("backend") or identity.get("graphify:backend")
+    model = identity.get("model") or identity.get("graphify:model") or ""
+    expected_digest = identity.get("model_digest") or identity.get("graphify:model_digest")
+    expected_dim = identity.get("dimension") or identity.get("graphify:dimension")
+
+    if not backend:
+        raise ModelIdentityError("Identifikatsiyada backend ko'rsatilmagan")
+    if not model:
+        raise ModelIdentityError("Identifikatsiyada model nomi ko'rsatilmagan")
+    if expected_dim is None:
+        raise ModelIdentityError("Identifikatsiyada model dimension ko'rsatilmagan")
+
+    if backend == "ollama":
+        if not expected_digest:
+            raise ModelIdentityError("Identifikatsiyada model_digest ko'rsatilmagan")
+        ollama_url = base_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        actual_digest = get_ollama_model_digest(ollama_url, model)
+        if actual_digest != expected_digest:
+            raise ModelIdentityError(
+                f"Model digest mos kelmadi: kutilgan={expected_digest}, haqiqiy={actual_digest}"
+            )
+        try:
+            embedder = OllamaEmbedder(base_url=ollama_url, model=model)
+        except Exception as e:
+            raise ModelIdentityError(f"Ollama embedder yaratib bo'lmadi: {e}") from e
+    elif backend == "local":
+        embedder = LocalEmbedder()
+    elif backend == "openai":
+        cfg = load_models_config()
+        sub = (cfg.get("config") or {}).get("openai", {})
+        embedder = OpenAIEmbedder(api_key=sub.get("api_key", ""), model=model or sub.get("model", "text-embedding-3-small"))
+    elif backend == "custom":
+        cfg = load_models_config()
+        sub = (cfg.get("config") or {}).get("custom", {})
+        embedder = CustomAPIEmbedder(base_url=sub.get("base_url", ""), api_key=sub.get("api_key", ""), model=model or sub.get("model", ""))
+    else:
+        raise ModelIdentityError(f"Noma'lum embedder backend: {backend}")
+
+    # 1-query self-test
+    try:
+        test_vec = embedder.encode(["self-test"])
+        if hasattr(test_vec, "tolist"):
+            test_vec = test_vec.tolist()
+        elif not isinstance(test_vec, list):
+            test_vec = list(test_vec)
+    except Exception as e:
+        raise ModelIdentityError(f"Embedder 1-query self-test xatoligi: {e}") from e
+
+    if not test_vec or not hasattr(test_vec[0], "__len__"):
+        raise ModelIdentityError("Embedder 1-query self-test natijasi noto'g'ri shaklda")
+
+    actual_dim = len(test_vec[0])
+    if actual_dim != int(expected_dim):
+        raise ModelIdentityError(
+            f"Model o'lchami mos kelmadi: kutilgan={expected_dim}, haqiqiy={actual_dim}"
+        )
+
+    return embedder
+
+
+
+def build_chroma_embedding_function(cfg: dict = None, identity: dict = None):
     """Return a chromadb-compatible embedding_function for get_or_create_collection().
 
-    Returns None for the "local" backend so chromadb just uses its own
-    built-in default (identical to Graphify's original zero-config behavior).
-    If the configured backend fails to initialize (missing dependency/key),
-    this falls back to None too — a bad models_config.json must never stop
-    the MCP server from starting.
+    If identity is provided, builds the exact embedder required and validates it
+    strictly (fails closed by raising ModelIdentityError, never falls back).
+
+    If identity is None, preserves today's models_config.json behavior:
+    returns None for "local" or falls back to None on startup initialization errors.
     """
+    if identity:
+        backend = identity.get("backend") or identity.get("graphify:backend") or "ollama"
+        embedder = build_identity_embedder(identity)
+        return _ChromaEmbeddingFunctionAdapter(embedder, backend)
+
     cfg = cfg or load_models_config()
     kind = cfg.get("embedder_type", "local")
     if kind == "local":

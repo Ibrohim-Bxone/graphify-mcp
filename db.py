@@ -64,12 +64,205 @@ def get_db_mtime() -> float:
     return max(mtimes) if mtimes else 0.0
 
 
+def _check_identity_conflict(source_a: dict, name_a: str, source_b: dict, name_b: str) -> None:
+    """Compares key identity fields between two sources and raises ModelIdentityError on mismatch."""
+    keys_to_compare = [
+        ("model", str),
+        ("model_digest", str),
+        ("dimension", int),
+        ("backend", str),
+    ]
+    for key, cast_type in keys_to_compare:
+        val_a = source_a.get(key) if source_a.get(key) is not None else source_a.get(f"graphify:{key}")
+        val_b = source_b.get(key) if source_b.get(key) is not None else source_b.get(f"graphify:{key}")
+        if val_a is not None and val_b is not None:
+            if cast_type(val_a) != cast_type(val_b):
+                from embedders import ModelIdentityError
+                raise ModelIdentityError(
+                    f"Model identifikatsiyasi nomuvofiq ({name_a} vs {name_b}): "
+                    f"{key} ({val_a} != {val_b})"
+                )
+
+
+def _align_chroma_collection_configuration(db_path: Path, collection_name: str = COLLECTION) -> None:
+    """Aligns Chroma collection embedding configuration with identity to prevent Chroma 1.5.9 conflict with 'default'."""
+    sqlite_file = db_path / "chroma.sqlite3"
+    if not sqlite_file.exists():
+        return
+    try:
+        conn = sqlite3.connect(str(sqlite_file), timeout=10.0)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id, schema_str FROM collections WHERE name = ?", (collection_name,))
+            row = cur.fetchone()
+            if row and row[1] and '"name":"default"' in row[1].replace(" ", ""):
+                cid, s_str = row
+                s_obj = json.loads(s_str)
+                def fix_ef(obj):
+                    if isinstance(obj, dict):
+                        if obj.get("embedding_function") == {"type": "known", "name": "default", "config": {}}:
+                            obj["embedding_function"] = {"type": "legacy"}
+                        for v in obj.values():
+                            fix_ef(v)
+                    elif isinstance(obj, list):
+                        for v in obj:
+                            fix_ef(v)
+                fix_ef(s_obj)
+                cur.execute("UPDATE collections SET schema_str = ? WHERE id = ?", (json.dumps(s_obj), cid))
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def get_db_identity(client=None, db_path: str = None) -> dict | None:
+    """Reads model identity metadata from collection metadata, SQLite, or graphify_manifest.json.
+
+    Returns dict if DB has identity metadata (v2), or None if DB has no identity (v1).
+    Raises ModelIdentityError if there is a conflict between manifest and collection identity metadata.
+    """
+    manifest_meta = {}
+    col_meta = {}
+
+    if STORAGE_MODE == "http":
+        if client is not None:
+            try:
+                col = client.get_collection(COLLECTION)
+                if col and col.metadata:
+                    c_meta = col.metadata
+                    if (
+                        c_meta.get("schema_version") == 2
+                        or c_meta.get("graphify:schema_version") == 2
+                        or "model_digest" in c_meta
+                        or "graphify:model_digest" in c_meta
+                        or "model" in c_meta
+                    ):
+                        col_meta.update(c_meta)
+            except Exception:
+                pass
+        if col_meta.get("schema_version") == 2 or col_meta.get("graphify:schema_version") == 2 or "model_digest" in col_meta or "graphify:model_digest" in col_meta or ("model" in col_meta and "dimension" in col_meta):
+            return col_meta
+        return None
+
+    path = Path(db_path or DB_PATH)
+
+    # 1. Check graphify_manifest.json
+    manifest_file = path / "graphify_manifest.json"
+    if manifest_file.exists():
+        try:
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("schema_version") == 2 or "model_digest" in data or "backend" in data or "model" in data:
+                manifest_meta.update(data)
+        except Exception:
+            pass
+
+    # 2. Check client existing collection
+    if client is not None:
+        try:
+            col = client.get_collection(COLLECTION)
+            if col and col.metadata:
+                c_meta = col.metadata
+                if (
+                    c_meta.get("schema_version") == 2
+                    or c_meta.get("graphify:schema_version") == 2
+                    or "model_digest" in c_meta
+                    or "graphify:model_digest" in c_meta
+                    or "model" in c_meta
+                ):
+                    col_meta.update(c_meta)
+        except Exception:
+            pass
+
+    # 3. Check SQLite collection_metadata if local
+    if STORAGE_MODE == "local" and not col_meta:
+        sqlite_file = path / "chroma.sqlite3"
+        if sqlite_file.exists():
+            try:
+                conn = sqlite3.connect(f"file:{sqlite_file.as_posix()}?mode=ro", uri=True, timeout=5.0)
+                try:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT m.key, m.str_value, m.int_value, m.float_value, m.bool_value
+                        FROM collection_metadata m
+                        JOIN collections c ON m.collection_id = c.id
+                        WHERE c.name = ?
+                    """, (COLLECTION,))
+                    rows = cur.fetchall()
+                    if rows:
+                        s_meta = {}
+                        for k, s, i, f, b in rows:
+                            val = bool(b) if b is not None else i if i is not None else f if f is not None else s
+                            s_meta[k] = val
+                        if (
+                            s_meta.get("schema_version") == 2
+                            or s_meta.get("graphify:schema_version") == 2
+                            or "model_digest" in s_meta
+                            or "graphify:model_digest" in s_meta
+                            or "model" in s_meta
+                        ):
+                            col_meta.update(s_meta)
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+    has_manifest_id = (
+        manifest_meta.get("schema_version") == 2
+        or "model_digest" in manifest_meta
+        or ("model" in manifest_meta and "dimension" in manifest_meta)
+    )
+    has_col_id = (
+        col_meta.get("schema_version") == 2
+        or col_meta.get("graphify:schema_version") == 2
+        or "model_digest" in col_meta
+        or "graphify:model_digest" in col_meta
+        or ("model" in col_meta and "dimension" in col_meta)
+    )
+
+    if has_manifest_id and has_col_id:
+        _check_identity_conflict(manifest_meta, "manifest", col_meta, "kolleksiya")
+
+    meta = {}
+    if manifest_meta:
+        meta.update(manifest_meta)
+    if col_meta:
+        meta.update(col_meta)
+
+    if meta.get("schema_version") == 2 or meta.get("graphify:schema_version") == 2 or "model_digest" in meta or "graphify:model_digest" in meta or ("model" in meta and "dimension" in meta):
+        return meta
+    return None
+
+
 def _open_collection(client):
     """Kolleksiyani mos embedder bilan ochadi yoki yaratadi.
 
-    models_config.json'dagi embedder mavjud bazadagi bilan mos kelmasa yoki
-    xato bersa, saqlangan/default embedderga qaytadi.
+    Agar bazada model identifikatsiyasi bo'lsa (v2):
+    aynan o'sha embedder quriladi va tekshiriladi; mos kelmasa yoki xato bersa
+    RAISE qiladi, hech qachon lokal MiniLM ga qaytmaydi (fail closed).
+
+    Identifikatsiya bo'lmasa (v1):
+    bugungi xatti-harakat saqlanadi (models_config bo'yicha yoki lokal default fallback).
     """
+    identity = get_db_identity(client=client)
+    if identity:
+        if STORAGE_MODE == "local":
+            _align_chroma_collection_configuration(Path(DB_PATH), COLLECTION)
+        embed_fn = build_chroma_embedding_function(identity=identity)
+        space = identity.get("distance") or identity.get("hnsw:space") or "cosine"
+        kwargs = {"metadata": {"hnsw:space": space}}
+        if embed_fn is not None:
+            kwargs["embedding_function"] = embed_fn
+        # Fail closed: never catch or fall back on identity failure!
+        try:
+            return client.get_or_create_collection(COLLECTION, **kwargs)
+        except ValueError as e:
+            if "Embedding function conflict" in str(e) and STORAGE_MODE == "local":
+                _align_chroma_collection_configuration(Path(DB_PATH), COLLECTION)
+                return client.get_or_create_collection(COLLECTION, **kwargs)
+            raise
+
     embed_fn = build_chroma_embedding_function()
     kwargs = {"metadata": {"hnsw:space": "cosine"}}
     if embed_fn is not None:
