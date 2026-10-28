@@ -70,6 +70,24 @@ GATES = [0.8, 0.5, 0.0]
 QUERY_TYPES = ["uz_need", "en_need", "uz_name", "en_name"]
 
 
+def get_effective_space(col_config: dict | None, col_meta: dict | None) -> str:
+    """Resolve effective distance metric (space) from configuration_json (authoritative), else metadata, else fail."""
+    space = None
+    if isinstance(col_config, dict):
+        hnsw_cfg = col_config.get("hnsw")
+        if isinstance(hnsw_cfg, dict):
+            space = hnsw_cfg.get("space")
+        elif "space" in col_config and isinstance(col_config.get("space"), str):
+            space = col_config.get("space")
+    if not space and isinstance(col_meta, dict):
+        space = col_meta.get("hnsw:space")
+        if not space and "hnsw" in col_meta and isinstance(col_meta["hnsw"], dict):
+            space = col_meta["hnsw"].get("space")
+    if not space:
+        raise ValueError("v1 manbasi uchun samarali masofa metriki (space) topilmadi: taxmin qilinmaydi")
+    return str(space)
+
+
 def run_worker(version: str, db_path: str, queries_file: str, worker_out: str) -> None:
     """Worker process: configure environment & model config before importing Graphify modules.
 
@@ -243,6 +261,9 @@ def generate_markdown_report(report_data: dict, output_path: Path) -> None:
     )
 
     table_rows = []
+    v1_gate_data = {}
+    v2_gate_data = {}
+
     for ver_name, model_name, res_dict in [("v1", "MiniLM", v1_res), ("v2", "bge-m3", v2_res)]:
         for gate in [0.8, 0.5, 0.0]:
             g_str = str(gate)
@@ -261,6 +282,12 @@ def generate_markdown_report(report_data: dict, output_path: Path) -> None:
             avg_recall = round((r_uz_n + r_en_n + r_uz_m + r_en_m) / 4.0, 4)
             avg_mrr = round((m_uz_n + m_en_n + m_uz_m + m_en_m) / 4.0, 4)
 
+            entry = {"recall": avg_recall, "mrr": avg_mrr, "uz_mrr": round((m_uz_n + m_uz_m) / 2.0, 4)}
+            if ver_name == "v1":
+                v1_gate_data[gate] = entry
+            else:
+                v2_gate_data[gate] = entry
+
             row = (
                 f"| **{ver_name}** ({model_name}) | `{gate}` | "
                 f"{r_uz_n:.2f} / {m_uz_n:.2f} | "
@@ -270,6 +297,34 @@ def generate_markdown_report(report_data: dict, output_path: Path) -> None:
                 f"**{avg_recall:.2f}** | **{avg_mrr:.2f}** |"
             )
             table_rows.append(row)
+
+    v1_g8 = v1_gate_data.get(0.8, {})
+    v2_g8 = v2_gate_data.get(0.8, {})
+    v2_g0 = v2_gate_data.get(0.0, {})
+
+    v1_uz_8 = v1_g8.get("uz_mrr", 0.0)
+    v2_uz_8 = v2_g8.get("uz_mrr", 0.0)
+    if v2_uz_8 > v1_uz_8:
+        uz_sentence = f"bge-m3 modeli o'zbekcha so'rovlarda MiniLM ga nisbatan yuqori semantik bog'liqlik ko'rsatdi (MRR: {v2_uz_8:.2f} vs {v1_uz_8:.2f})."
+    elif v2_uz_8 < v1_uz_8:
+        uz_sentence = f"MiniLM modeli o'zbekcha so'rovlarda bge-m3 ga nisbatan yuqori semantik bog'liqlik ko'rsatdi (MRR: {v1_uz_8:.2f} vs {v2_uz_8:.2f})."
+    else:
+        uz_sentence = f"O'zbekcha so'rovlarda ikkala model teng semantik bog'liqlik ko'rsatdi (MRR: {v1_uz_8:.2f})."
+
+    v2_mrr_8 = v2_g8.get("mrr", 0.0)
+    v2_mrr_0 = v2_g0.get("mrr", 0.0)
+    if v2_mrr_0 > v2_mrr_8:
+        gate_sentence = f"Gate 0.8 dan 0.0 ga tushirilganda bge-m3 MRR ko'rsatkichi {v2_mrr_8:.2f} dan {v2_mrr_0:.2f} ga ortdi."
+    elif v2_mrr_0 < v2_mrr_8:
+        gate_sentence = f"Gate 0.8 dan 0.0 ga tushirilganda bge-m3 MRR ko'rsatkichi {v2_mrr_8:.2f} dan {v2_mrr_0:.2f} ga pasaydi."
+    else:
+        gate_sentence = f"Gate 0.8 dan 0.0 ga o'zgartirilganda bge-m3 MRR ko'rsatkichi o'zgarishsiz qoldi ({v2_mrr_8:.2f})."
+
+    v1_mrr_8 = v1_g8.get("mrr", 0.0)
+    if v2_mrr_8 >= v1_mrr_8:
+        rec_sentence = f"O'lchangan natijalarga ko'ra bge-m3 asosiy embedder sifatida tavsiya etiladi (MRR: {v2_mrr_8:.2f} vs {v1_mrr_8:.2f})."
+    else:
+        rec_sentence = f"O'lchangan natijalarga ko'ra MiniLM yuqoriroq natija ko'rsatdi (MRR: {v1_mrr_8:.2f} vs {v2_mrr_8:.2f})."
 
     md_content = f"""# Graphify v1 vs v2 Qidiruv Tahlili va Baholash Hisoboti
 
@@ -297,16 +352,13 @@ Ushbu hisobot Graphify bilimlar bazasining ikki avlodi: **v1** (MiniLM-L6-v2, 38
 ## 🔍 Tahlil va Asosiy Xulosalar
 
 1. **Ko'p tillilik (O'zbek tili) samaradorligi:**
-   - **`bge-m3`** modeli o'zbek tilidagi tavsifiy (`uz_need`) va nomli (`uz_name`) so'rovlarda MiniLM ga nisbatan ancha yuqori semantik bog'liqlikni namoyish etadi.
-   - MiniLM faqat ingliz tiliga ixtisoslashganligi sababli, o'zbekcha so'rovlarda asosan leksik (kalit so'z) moslikka suyanadi. `bge-m3` esa o'zbek va ingliz tillarida to'liq ko'p tilli vektor fazosini ta'minlaydi.
+   - {uz_sentence}
 
 2. **Leksik Gate (`MIN_COVERAGE`) ta'siri:**
-   - `MIN_COVERAGE = 0.8` darajasida qat'iy leksik filtr qo'llanilganda, so'rov so'zlarining 80% ulushi hujjatda aynan uchrashi talab etiladi. Bu aniqlikni oshiradi, lekin sinonimik yoki erkin tildagi qidiruvlarda natijalarni cheklashi mumkin.
-   - Gate `0.5` va `0.0` ga tushirilganda, semantik (vektor) qidiruvning to'liq kuchi ochiladi va `bge-m3` ning MRR ko'rsatkichi sezilarli darajada ortadi.
+   - {gate_sentence}
 
 3. **Tavsiya:**
-   - Tizimni v2 ga bosqichma-bosqich o'tkazishda `bge-m3` asosiy embedder sifatida tavsiya etiladi.
-   - Shuningdek, `MIN_COVERAGE` parametrini 0.8 dan 0.5 atrofida muvozanatlash tavsiya qilinadi, bu esa o'zbekcha semantik mosliklarni yo'qotmasdan noto'g'ri dalillarni filtrlash imkonini beradi.
+   - {rec_sentence}
 """
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -396,7 +448,7 @@ def main():
 
         import chromadb
         v1_client = chromadb.PersistentClient(path=str(v1_replica))
-        space = col_meta.get("hnsw:space", "cosine")
+        space = get_effective_space(col_config, col_meta)
         v1_col = v1_client.get_or_create_collection(name=col_name, metadata={"hnsw:space": space})
         if v1_records:
             batch_size = 50
@@ -431,6 +483,8 @@ def main():
         worker_env = os.environ.copy()
         worker_env["GRAPHIFY_STORAGE_MODE"] = "local"
 
+        worker_timeout = float(os.environ.get("GRAPHIFY_EVAL_WORKER_TIMEOUT", 5400.0))
+
         # 1. Run v1 in separate subprocess against disposable replica
         print("[eval_v2] v1 (MiniLM) qidiruv yo'li alohida jarayonda baholanmoqda...", flush=True)
         cmd_v1 = [
@@ -446,7 +500,12 @@ def main():
             "--worker-out",
             str(v1_out_file.resolve()),
         ]
-        res_v1 = subprocess.run(cmd_v1, env=worker_env, cwd=str(PROJECT_ROOT), capture_output=True, text=True)
+        try:
+            res_v1 = subprocess.run(cmd_v1, env=worker_env, cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=worker_timeout)
+        except subprocess.TimeoutExpired as e:
+            print(f"[eval_v2] v1 worker vaqt limiti ({worker_timeout}s) tugadi", file=sys.stderr)
+            raise RuntimeError(f"v1 baholash worker vaqt limiti ({worker_timeout}s) tugadi") from e
+
         if res_v1.returncode != 0:
             print(f"[eval_v2] v1 worker xatosi:\n{res_v1.stderr}", file=sys.stderr)
             raise RuntimeError(f"v1 baholash worker xatosi bilan to'xtadi (kod {res_v1.returncode}):\n{res_v1.stderr}")
@@ -468,7 +527,12 @@ def main():
             "--worker-out",
             str(v2_out_file.resolve()),
         ]
-        res_v2 = subprocess.run(cmd_v2, env=worker_env, cwd=str(PROJECT_ROOT), capture_output=True, text=True)
+        try:
+            res_v2 = subprocess.run(cmd_v2, env=worker_env, cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=worker_timeout)
+        except subprocess.TimeoutExpired as e:
+            print(f"[eval_v2] v2 worker vaqt limiti ({worker_timeout}s) tugadi", file=sys.stderr)
+            raise RuntimeError(f"v2 baholash worker vaqt limiti ({worker_timeout}s) tugadi") from e
+
         if res_v2.returncode != 0:
             print(f"[eval_v2] v2 worker xatosi:\n{res_v2.stderr}", file=sys.stderr)
             raise RuntimeError(f"v2 baholash worker xatosi bilan to'xtadi (kod {res_v2.returncode}):\n{res_v2.stderr}")

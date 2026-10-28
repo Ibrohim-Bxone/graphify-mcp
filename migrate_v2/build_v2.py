@@ -189,8 +189,151 @@ def embed_text_with_retry(embedder, text: str, max_retries: int = 5, initial_bac
     raise RuntimeError(f"Ollama embedding xatoligi ({max_retries} urinishdan so'ng): {last_err}") from last_err
 
 
-def rebuild_keyword_index_subprocess(out_dir: Path) -> None:
+def remove_completion_marker(out_dir: Path) -> None:
+    """Remove build_complete.json before mutating destination; abort if removal fails."""
+    complete_file = out_dir / "build_complete.json"
+    if complete_file.exists():
+        try:
+            complete_file.unlink()
+        except Exception as e:
+            raise RuntimeError(f"build_complete.json o'chirish muvaffaqiyatsiz bo'ldi: {e}") from e
+
+
+def validate_destination_persisted_identity(
+    out_dir: Path,
+    col_name: str,
+    expected_model: str,
+    expected_digest: str,
+    expected_dimension: int,
+    client=None,
+) -> None:
+    """Validate that any persisted manifest and collection identity in out_dir matches expected model identity.
+
+    Fails closed if:
+    - manifest exists but is unreadable or malformed JSON
+    - manifest identity mismatches expected model, digest, or dimension
+    - collection exists and has identity metadata that mismatches expected model, digest, or dimension
+    - manifest and collection metadata conflict with each other
+    """
+    manifest_meta = {}
+    manifest_file = out_dir / "graphify_manifest.json"
+    if manifest_file.exists():
+        try:
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                manifest_meta = json.load(f)
+        except Exception as e:
+            raise ModelIdentityError(f"Sync rad etildi: Destination manifest fayli o'qib bo'lmadi yoki yaroqsiz: {e}") from e
+
+        if not isinstance(manifest_meta, dict):
+            raise ModelIdentityError("Sync rad etildi: Destination manifest fayli yaroqsiz (JSON lug'at emas)")
+
+        m_model = manifest_meta.get("model")
+        m_digest = manifest_meta.get("model_digest")
+        m_dim = manifest_meta.get("dimension")
+
+        if not m_model or m_model != expected_model:
+            raise ModelIdentityError(
+                f"Sync rad etildi: Destination manifest model mos kelmadi: mavjud={m_model}, kutilgan={expected_model}"
+            )
+        if not m_digest or m_digest != expected_digest:
+            raise ModelIdentityError(
+                f"Sync rad etildi: Destination manifest model_digest mos kelmadi: mavjud={m_digest}, kutilgan={expected_digest}"
+            )
+        if m_dim is None or int(m_dim) != expected_dimension:
+            raise ModelIdentityError(
+                f"Sync rad etildi: Destination manifest dimension mos kelmadi: mavjud={m_dim}, kutilgan={expected_dimension}"
+            )
+
+    col_meta = {}
+    col_count = 0
+    if client is not None:
+        try:
+            col = client.get_collection(col_name)
+            if col:
+                if isinstance(getattr(col, "metadata", None), dict):
+                    col_meta = col.metadata
+                try:
+                    cnt = col.count()
+                    col_count = int(cnt) if isinstance(cnt, (int, float)) else 0
+                except Exception:
+                    col_count = 0
+        except Exception as e:
+            from db import _is_absent_collection_error
+            if not _is_absent_collection_error(e):
+                raise
+
+    if not col_meta:
+        sqlite_file = out_dir / "chroma.sqlite3"
+        if sqlite_file.exists():
+            try:
+                conn = sqlite3.connect(f"file:{sqlite_file.as_posix()}?mode=ro", uri=True, timeout=5.0)
+                try:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT m.key, m.str_value, m.int_value, m.float_value, m.bool_value
+                        FROM collection_metadata m
+                        JOIN collections c ON m.collection_id = c.id
+                        WHERE c.name = ?
+                    """, (col_name,))
+                    rows = cur.fetchall()
+                    if rows:
+                        s_meta = {}
+                        for k, s, i, f, b in rows:
+                            val = bool(b) if b is not None else i if i is not None else f if f is not None else s
+                            s_meta[k] = val
+                        col_meta = s_meta
+                finally:
+                    conn.close()
+            except sqlite3.OperationalError as e:
+                if "no such table" not in str(e).lower():
+                    raise
+            except Exception:
+                raise
+
+    if isinstance(col_count, (int, float)) and col_count > 0:
+        c_model = col_meta.get("model") or col_meta.get("graphify:model")
+        c_digest = col_meta.get("model_digest") or col_meta.get("graphify:model_digest")
+        c_dim = col_meta.get("dimension") or col_meta.get("graphify:dimension")
+
+        if not c_model or c_model != expected_model:
+            raise ModelIdentityError(
+                f"Sync rad etildi: Destination kolleksiyada yozuvlar mavjud, ammo model mos kelmadi yoki yo'q: mavjud={c_model}, kutilgan={expected_model}"
+            )
+        if not c_digest or c_digest != expected_digest:
+            raise ModelIdentityError(
+                f"Sync rad etildi: Destination kolleksiyada yozuvlar mavjud, ammo model_digest mos kelmadi yoki yo'q: mavjud={c_digest}, kutilgan={expected_digest}"
+            )
+        if c_dim is None or int(c_dim) != expected_dimension:
+            raise ModelIdentityError(
+                f"Sync rad etildi: Destination kolleksiyada yozuvlar mavjud, ammo dimension mos kelmadi yoki yo'q: mavjud={c_dim}, kutilgan={expected_dimension}"
+            )
+    elif col_meta:
+        c_model = col_meta.get("model") or col_meta.get("graphify:model")
+        c_digest = col_meta.get("model_digest") or col_meta.get("graphify:model_digest")
+        c_dim = col_meta.get("dimension") or col_meta.get("graphify:dimension")
+
+        if c_model and c_model != expected_model:
+            raise ModelIdentityError(
+                f"Sync rad etildi: Destination kolleksiya model mos kelmadi: mavjud={c_model}, kutilgan={expected_model}"
+            )
+        if c_digest and c_digest != expected_digest:
+            raise ModelIdentityError(
+                f"Sync rad etildi: Destination kolleksiya model_digest mos kelmadi: mavjud={c_digest}, kutilgan={expected_digest}"
+            )
+        if c_dim is not None and int(c_dim) != expected_dimension:
+            raise ModelIdentityError(
+                f"Sync rad etildi: Destination kolleksiya dimension mos kelmadi: mavjud={c_dim}, kutilgan={expected_dimension}"
+            )
+
+    if manifest_meta and col_meta:
+        from db import _check_identity_conflict
+        _check_identity_conflict(manifest_meta, "manifest", col_meta, "kolleksiya")
+
+
+def rebuild_keyword_index_subprocess(out_dir: Path, timeout: float = None) -> None:
     """Run keyword_index.rebuild() in an isolated subprocess with GRAPHIFY_DB_PATH set to out_dir."""
+    if timeout is None:
+        timeout = float(os.environ.get("GRAPHIFY_KEYWORD_REBUILD_TIMEOUT", 1800.0))
     env = dict(os.environ)
     env["GRAPHIFY_DB_PATH"] = str(out_dir.resolve())
     env["GRAPHIFY_STORAGE_MODE"] = "local"
@@ -200,7 +343,12 @@ def rebuild_keyword_index_subprocess(out_dir: Path) -> None:
         "import sys; sys.path.insert(0, '.'); import keyword_index; keyword_index.rebuild()",
     ]
     print(f"[keyword_index] Qayta qurish boshlandi: GRAPHIFY_DB_PATH={out_dir}...", flush=True)
-    res = subprocess.run(cmd, env=env, cwd=str(PROJECT_ROOT), capture_output=True, text=True)
+    try:
+        res = subprocess.run(cmd, env=env, cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        print(f"[keyword_index] Qayta qurish vaqt limiti ({timeout}s) tugadi", file=sys.stderr)
+        raise RuntimeError(f"keyword_index qayta qurish vaqt limiti ({timeout}s) tugadi") from e
+
     if res.returncode != 0:
         print(f"[keyword_index] Xatolik yuz berdi:\nSTDERR:\n{res.stderr}\nSTDOUT:\n{res.stdout}", file=sys.stderr)
         res.check_returncode()
@@ -377,29 +525,23 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
     v1_map = {r["id"]: r for r in v1_records}
     corpus_hash = compute_corpus_hash(v1_records)
 
-    # Strictly validate model identity before ANY mutation (Finding 2 & 6)
+    # Strictly validate model identity before ANY mutation
     model_digest = get_ollama_model_digest(
         BGE_M3_CONFIG["config"]["ollama"]["base_url"],
         BGE_M3_CONFIG["config"]["ollama"]["model"],
     )
-    manifest_file = out_dir / "graphify_manifest.json"
-    if manifest_file.exists():
-        try:
-            with open(manifest_file, "r", encoding="utf-8") as f:
-                m_exist = json.load(f)
-            if (
-                m_exist.get("model") != "bge-m3"
-                or m_exist.get("model_digest") != model_digest
-                or int(m_exist.get("dimension", 0)) != EXPECTED_DIMENSION
-            ):
-                raise ModelIdentityError(
-                    f"Sync rad etildi: mavjud v2 identity ({m_exist.get('model')}, {m_exist.get('model_digest')}) "
-                    f"joriy modelga mos kelmadi (bge-m3, {model_digest})!"
-                )
-        except ModelIdentityError:
-            raise
-        except Exception:
-            pass
+
+    import chromadb
+
+    client = chromadb.PersistentClient(path=str(out_dir))
+    validate_destination_persisted_identity(
+        out_dir=out_dir,
+        col_name=col_name,
+        expected_model="bge-m3",
+        expected_digest=model_digest,
+        expected_dimension=EXPECTED_DIMENSION,
+        client=client,
+    )
 
     space = col_meta.get("hnsw:space", "l2")
     sync_identity = {
@@ -410,16 +552,14 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         "dimension": EXPECTED_DIMENSION,
         "distance": space,
     }
-
-    import chromadb
-
-    client = chromadb.PersistentClient(path=str(out_dir))
     embed_fn = build_chroma_embedding_function(identity=sync_identity)
     col = client.get_or_create_collection(
         name=col_name,
-        metadata={"hnsw:space": space},
+        metadata={"hnsw:space": space, **sync_identity},
         embedding_function=embed_fn,
     )
+    # Persist identity metadata before any upsert (Finding 1 & TOPILMA 2)
+    col.modify(metadata={**{k: v for k, v in (col.metadata if isinstance(col.metadata, dict) else {}).items() if not k.startswith("hnsw:")}, **sync_identity})
 
     # Fetch destination records to compare hashes
     dest_data = col.get(include=["documents", "metadatas"])
@@ -450,6 +590,7 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         flush=True,
     )
 
+    manifest_file = out_dir / "graphify_manifest.json"
     complete_file = out_dir / "build_complete.json"
     kw_sqlite = out_dir / "keyword_index.sqlite3"
     needs_rebuild = bool(to_upsert or to_delete or not complete_file.exists() or not kw_sqlite.exists() or not manifest_file.exists())
@@ -481,12 +622,8 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         except Exception:
             needs_rebuild = True
 
-    # Invalidate completion status before mutations so interrupted sync cannot leave broken state (Finding 4)
-    if complete_file.exists():
-        try:
-            complete_file.unlink()
-        except OSError:
-            pass
+    # Invalidate completion status before mutations, keyword rebuild, or manifest update (Finding 5 & TOPILMA 3)
+    remove_completion_marker(out_dir)
 
     if to_delete:
         print(f"[sync] {len(to_delete)} ta yozuv o'chirilmoqda...", flush=True)
@@ -591,10 +728,20 @@ def main():
     client = chromadb.PersistentClient(path=str(out_dir))
     space = col_meta.get("hnsw:space", "l2")
 
-    # Fetch model digest without falling back to unknown (Finding 6)
+    # Fetch model digest without falling back to unknown
     model_digest = get_ollama_model_digest(
         BGE_M3_CONFIG["config"]["ollama"]["base_url"],
         BGE_M3_CONFIG["config"]["ollama"]["model"],
+    )
+
+    # Validate persisted collection AND manifest identity before any destination mutation
+    validate_destination_persisted_identity(
+        out_dir=out_dir,
+        col_name=col_name,
+        expected_model="bge-m3",
+        expected_digest=model_digest,
+        expected_dimension=EXPECTED_DIMENSION,
+        client=client,
     )
 
     merged_metadata = dict(col_meta)
@@ -617,6 +764,8 @@ def main():
         configuration=col_config,
         embedding_function=embed_fn,
     )
+    # Persist identity metadata before any upsert (Finding 1 & TOPILMA 2)
+    col.modify(metadata={**{k: v for k, v in (col.metadata if isinstance(col.metadata, dict) else {}).items() if not k.startswith("hnsw:")}, **merged_metadata})
 
     # Resumable: compare destination document+metadata hashes, do not skip changed ids!
     dest_data = col.get(include=["documents", "metadatas"])
@@ -624,14 +773,9 @@ def main():
     for did, doc, meta in zip(dest_data["ids"], dest_data["documents"], dest_data["metadatas"]):
         dest_map[did] = (doc, meta)
 
-    # Finding 14: Delete removed destination records on resume/build
+    # Delete removed destination records on resume/build
     records_map = {r["id"]: r for r in records}
     to_delete = [did for did in dest_map if did not in records_map]
-    if to_delete:
-        print(f"[build_v2] Manbadan o'chirilgan {len(to_delete)} ta yozuv v2 dan o'chirilmoqda...", flush=True)
-        col.delete(ids=to_delete)
-        for did in to_delete:
-            dest_map.pop(did, None)
 
     pending = []
     for r in records:
@@ -644,6 +788,15 @@ def main():
             cur_d_hash, cur_m_hash = compute_hashes(dest_doc, dest_meta)
             if cur_d_hash != d_hash or cur_m_hash != m_hash:
                 pending.append(r)
+
+    # Remove completion marker before first mutation, keyword rebuild, or manifest update (Finding 5 & TOPILMA 3)
+    remove_completion_marker(out_dir)
+
+    if to_delete:
+        print(f"[build_v2] Manbadan o'chirilgan {len(to_delete)} ta yozuv v2 dan o'chirilmoqda...", flush=True)
+        col.delete(ids=to_delete)
+        for did in to_delete:
+            dest_map.pop(did, None)
 
     print(
         f"[build_v2] Mavjud to'g'ri yozuvlar: {len(dest_map) - (len(pending) - (len(records) - len(dest_map)))}, "

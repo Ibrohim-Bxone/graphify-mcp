@@ -116,11 +116,34 @@ def _align_chroma_collection_configuration(db_path: Path, collection_name: str =
         pass
 
 
+def _is_absent_collection_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    if "tenant" in msg:
+        return False
+    try:
+        import chromadb.errors
+        if isinstance(e, chromadb.errors.NotFoundError):
+            return "collection" in msg and ("does not exist" in msg or "not found" in msg)
+        if hasattr(chromadb.errors, "InvalidCollectionException") and isinstance(e, chromadb.errors.InvalidCollectionException):
+            return True
+    except (ImportError, AttributeError):
+        pass
+    err_cls_name = type(e).__name__
+    if err_cls_name == "InvalidCollectionException":
+        return True
+    if err_cls_name == "NotFoundError":
+        return "collection" in msg and ("does not exist" in msg or "not found" in msg)
+    if isinstance(e, ValueError):
+        return "collection" in msg and ("does not exist" in msg or "not found" in msg)
+    return False
+
+
 def get_db_identity(client=None, db_path: str = None) -> dict | None:
     """Reads model identity metadata from collection metadata, SQLite, or graphify_manifest.json.
 
     Returns dict if DB has identity metadata (v2), or None if DB has no identity (v1).
     Raises ModelIdentityError if there is a conflict between manifest and collection identity metadata.
+    Propagates read errors: only a confirmed absent collection may take the legacy path.
     """
     manifest_meta = {}
     col_meta = {}
@@ -129,7 +152,7 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
         if client is not None:
             try:
                 col = client.get_collection(COLLECTION)
-                if col and col.metadata:
+                if col and isinstance(getattr(col, "metadata", None), dict):
                     c_meta = col.metadata
                     if (
                         c_meta.get("schema_version") == 2
@@ -139,8 +162,9 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
                         or "model" in c_meta
                     ):
                         col_meta.update(c_meta)
-            except Exception:
-                pass
+            except Exception as e:
+                if not _is_absent_collection_error(e):
+                    raise
         if col_meta.get("schema_version") == 2 or col_meta.get("graphify:schema_version") == 2 or "model_digest" in col_meta or "graphify:model_digest" in col_meta or ("model" in col_meta and "dimension" in col_meta):
             return col_meta
         return None
@@ -155,14 +179,15 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
                 data = json.load(f)
             if data.get("schema_version") == 2 or "model_digest" in data or "backend" in data or "model" in data:
                 manifest_meta.update(data)
-        except Exception:
-            pass
+        except Exception as e:
+            from embedders import ModelIdentityError
+            raise ModelIdentityError(f"graphify_manifest.json o'qishda xatolik: {e}") from e
 
     # 2. Check client existing collection
     if client is not None:
         try:
             col = client.get_collection(COLLECTION)
-            if col and col.metadata:
+            if col and isinstance(getattr(col, "metadata", None), dict):
                 c_meta = col.metadata
                 if (
                     c_meta.get("schema_version") == 2
@@ -172,8 +197,9 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
                     or "model" in c_meta
                 ):
                     col_meta.update(c_meta)
-        except Exception:
-            pass
+        except Exception as e:
+            if not _is_absent_collection_error(e):
+                raise
 
     # 3. Check SQLite collection_metadata if local
     if STORAGE_MODE == "local" and not col_meta:
@@ -205,8 +231,11 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
                             col_meta.update(s_meta)
                 finally:
                     conn.close()
+            except sqlite3.OperationalError as e:
+                if "no such table" not in str(e).lower():
+                    raise
             except Exception:
-                pass
+                raise
 
     has_manifest_id = (
         manifest_meta.get("schema_version") == 2
