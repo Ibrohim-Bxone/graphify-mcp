@@ -100,3 +100,13 @@ def test_unit_length_cache():
     
     make_scorer(col)
     assert col.get_calls == 1  # cached by name
+
+def test_make_scorer_space_from_configuration_json():
+    # Chroma modify() metadata'ni to'liq almashtiradi va hnsw:space yo'qoladi; space configuration_json da qoladi
+    class ConfiguredCollection:
+        metadata = {"model": "bge-m3", "distance": "l2"}
+        configuration_json = {"hnsw": {"space": "cosine"}}
+
+    scorer = make_scorer(ConfiguredCollection())
+    sim, raw = scorer(0.3)
+    assert np.isclose(raw, 0.7)

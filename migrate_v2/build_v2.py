@@ -530,7 +530,8 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
     )
 
     # Update collection metadata in ChromaDB (Finding 5)
-    col.modify(metadata=identity)
+    # modify() replaces the whole metadata and rejects hnsw:* keys; the space stays in configuration_json
+    col.modify(metadata={**{k: v for k, v in (col.metadata if isinstance(col.metadata, dict) else {}).items() if not k.startswith("hnsw:")}, **identity})
 
     # Write build_complete.json atomically
     write_build_complete_atomic(out_dir, identity, started_at)
@@ -700,7 +701,8 @@ def main():
     )
 
     # Update collection metadata in ChromaDB (Finding 5)
-    col.modify(metadata=identity)
+    # modify() replaces the whole metadata and rejects hnsw:* keys; the space stays in configuration_json
+    col.modify(metadata={**{k: v for k, v in (col.metadata if isinstance(col.metadata, dict) else {}).items() if not k.startswith("hnsw:")}, **identity})
 
     # 7. Write build_complete.json atomically
     write_build_complete_atomic(out_dir, identity, started_at)

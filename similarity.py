@@ -82,7 +82,9 @@ def make_scorer(collection):
     """Kolleksiya uchun mos o'xshashlik hisoblagichni yaratadi."""
     metadata = collection.metadata or {}
     
-    space = metadata.get("hnsw:space")
+    config = getattr(collection, "configuration_json", None)
+    hnsw_config = config.get("hnsw") if isinstance(config, dict) else None
+    space = (hnsw_config or {}).get("space") or metadata.get("hnsw:space")
     if not space and "hnsw" in metadata and isinstance(metadata["hnsw"], dict):
         space = metadata["hnsw"].get("space")
         

@@ -378,7 +378,7 @@ def main():
     )
 
     t_start = time.time()
-    with tempfile.TemporaryDirectory(prefix="graphify_eval_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="graphify_eval_", ignore_cleanup_errors=True) as tmpdir:
         tmp_path = Path(tmpdir)
         tmp_queries_file = tmp_path / "queries.json"
         with open(tmp_queries_file, "w", encoding="utf-8") as f:
