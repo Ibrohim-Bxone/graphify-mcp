@@ -468,7 +468,7 @@ def test_cuda_listed_but_session_lands_on_cpu_fallback_with_reason(tmp_path):
 
     import onnxruntime
     with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
-        with patch.object(onnxruntime, "get_available_providers", return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]):
+        with patch.object(onnxruntime, "get_available_providers", return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]), patch.object(onnxruntime, "preload_dlls", Mock(), create=True):
             with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
                 with patch("onnxruntime.InferenceSession", side_effect=[mock_cuda_session, mock_cpu_session]):
                     inst, err = get_reranker_with_reason()
@@ -500,7 +500,7 @@ def test_fp16_file_missing_falls_back_to_cpu_with_reason(tmp_path):
 
     import onnxruntime
     with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
-        with patch.object(onnxruntime, "get_available_providers", return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]):
+        with patch.object(onnxruntime, "get_available_providers", return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]), patch.object(onnxruntime, "preload_dlls", Mock(), create=True):
             with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
                 with patch("onnxruntime.InferenceSession", return_value=mock_cpu_session):
                     inst, err = get_reranker_with_reason()
