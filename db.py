@@ -64,29 +64,75 @@ def get_db_mtime() -> float:
     return max(mtimes) if mtimes else 0.0
 
 
+def _parse_bool(val):
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int) and val in (0, 1):
+        return bool(val)
+    s = str(val).strip().lower()
+    if s in ("true", "1"):
+        return True
+    if s in ("false", "0"):
+        return False
+    raise ValueError(f"Noto'g'ri boolean qiymat: {val}")
+
+
+def _parse_int(val):
+    if isinstance(val, bool):
+        raise ValueError(f"Noto'g'ri integer qiymat (bool): {val!r}")
+    if isinstance(val, float):
+        if not val.is_integer():
+            raise ValueError(f"Noto'g'ri integer qiymat (kasr son): {val!r}")
+        return int(val)
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        try:
+            return int(s)
+        except ValueError:
+            try:
+                f = float(s)
+                if f.is_integer():
+                    return int(f)
+            except (ValueError, OverflowError):
+                pass
+            raise ValueError(f"Noto'g'ri integer qiymat: {val!r}")
+    raise ValueError(f"Noto'g'ri integer qiymat: {val!r}")
+
+
 def _check_identity_conflict(source_a: dict, name_a: str, source_b: dict, name_b: str) -> None:
     """Compares key identity fields between two sources and raises ModelIdentityError on mismatch."""
-    def _parse_bool(val):
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, int) and val in (0, 1):
-            return bool(val)
-        s = str(val).strip().lower()
-        if s in ("true", "1"):
-            return True
-        if s in ("false", "0"):
-            return False
-        raise ValueError(f"Noto'g'ri boolean qiymat: {val}")
-
     keys_to_compare = [
-        ("schema_version", int),
+        ("schema_version", _parse_int),
         ("backend", str),
         ("model", str),
         ("model_digest", str),
-        ("dimension", int),
+        ("dimension", _parse_int),
         ("distance", str),
         ("normalization", _parse_bool),
     ]
+    for src, name in ((source_a, name_a), (source_b, name_b)):
+        if not isinstance(src, dict):
+            continue
+        for key, cast_type in keys_to_compare:
+            val_plain = src.get(key)
+            val_pref = src.get(f"graphify:{key}")
+            if val_plain is not None and val_pref is not None:
+                differ = False
+                try:
+                    c1 = cast_type(val_plain)
+                    c2 = cast_type(val_pref)
+                    differ = (c1 != c2)
+                except Exception:
+                    differ = True
+                if differ:
+                    from embedders import ModelIdentityError
+                    raise ModelIdentityError(
+                        f"Model identifikatsiyasi nomuvofiq ({name}): "
+                        f"'{key}' va 'graphify:{key}' qiymatlari mos kelmadi ({val_plain} != {val_pref})"
+                    )
+
     for key, cast_type in keys_to_compare:
         val_a = source_a.get(key) if source_a.get(key) is not None else source_a.get(f"graphify:{key}")
         val_b = source_b.get(key) if source_b.get(key) is not None else source_b.get(f"graphify:{key}")
@@ -281,6 +327,34 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
         or "graphify:model_digest" in col_meta
         or ("model" in col_meta and "dimension" in col_meta)
     )
+
+    for src, name in ((manifest_meta, "manifest"), (col_meta, "kolleksiya")):
+        if src:
+            for key, cast_type in (
+                ("schema_version", _parse_int),
+                ("backend", str),
+                ("model", str),
+                ("model_digest", str),
+                ("dimension", _parse_int),
+                ("distance", str),
+                ("normalization", _parse_bool),
+            ):
+                val_plain = src.get(key)
+                val_pref = src.get(f"graphify:{key}")
+                if val_plain is not None and val_pref is not None:
+                    differ = False
+                    try:
+                        c1 = cast_type(val_plain)
+                        c2 = cast_type(val_pref)
+                        differ = (c1 != c2)
+                    except Exception:
+                        differ = True
+                    if differ:
+                        from embedders import ModelIdentityError
+                        raise ModelIdentityError(
+                            f"Model identifikatsiyasi nomuvofiq ({name}): "
+                            f"'{key}' va 'graphify:{key}' qiymatlari mos kelmadi ({val_plain} != {val_pref})"
+                        )
 
     if has_manifest_id and has_col_id:
         _check_identity_conflict(manifest_meta, "manifest", col_meta, "kolleksiya")

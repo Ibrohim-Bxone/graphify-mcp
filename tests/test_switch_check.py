@@ -350,3 +350,146 @@ def test_check_v2_identity_catches_malformed_dimension_within_fail_boundary_regr
     assert res_inf_col["status"] == "FAIL"
     assert "dimension" in res_inf_col["error"]
 
+
+def test_plain_and_prefixed_graphify_keys_conflict_fails_closed_regression_item_4(tmp_path):
+    """Finding 4 regression: when both <key> and graphify:<key> exist with different values, fail closed."""
+    from db import _check_identity_conflict
+    from embedders import ModelIdentityError
+    from migrate_v2.build_v2 import validate_destination_persisted_identity
+
+    valid_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:abc",
+        "dimension": 1024,
+        "distance": "l2",
+        "normalization": False,
+    }
+
+    # 1. _check_identity_conflict fails closed when intra-source keys conflict
+    conflicting_src_a = dict(valid_id, **{"graphify:model": "other-model"})
+    with pytest.raises(ModelIdentityError, match="mos kelmadi"):
+        _check_identity_conflict(conflicting_src_a, "manifest", valid_id, "kolleksiya")
+
+    conflicting_src_b = dict(valid_id, **{"graphify:dimension": 512})
+    with pytest.raises(ModelIdentityError, match="mos kelmadi"):
+        _check_identity_conflict(valid_id, "manifest", conflicting_src_b, "kolleksiya")
+
+    # 2. check_v2_identity returns FAIL when collection has conflicting plain and prefixed keys
+    col_dir = tmp_path / "f4_col_conflict"
+    col_dir.mkdir()
+    (col_dir / "graphify_manifest.json").write_text(json.dumps(valid_id), encoding="utf-8")
+    conflicting_col = dict(valid_id, **{"graphify:model": "different-model"})
+    _create_mock_v2_sqlite(col_dir, metadata=conflicting_col)
+    res = check_v2_identity(col_dir)
+    assert res["status"] == "FAIL"
+    assert "mos kelmadi" in res["error"]
+
+    # Manifest with conflicting plain and prefixed keys
+    m_dir = tmp_path / "f4_manifest_conflict"
+    m_dir.mkdir()
+    conflicting_m = dict(valid_id, **{"graphify:backend": "openai"})
+    (m_dir / "graphify_manifest.json").write_text(json.dumps(conflicting_m), encoding="utf-8")
+    _create_mock_v2_sqlite(m_dir, metadata=valid_id)
+    res_m = check_v2_identity(m_dir)
+    assert res_m["status"] == "FAIL"
+    assert "mos kelmadi" in res_m["error"]
+
+    # 3. validate_destination_persisted_identity raises ModelIdentityError on prefix conflict
+    dest_dir = tmp_path / "f4_build_v2_dest"
+    dest_dir.mkdir()
+    (dest_dir / "graphify_manifest.json").write_text(json.dumps(conflicting_m), encoding="utf-8")
+    with pytest.raises(ModelIdentityError, match="mos kelmadi"):
+        validate_destination_persisted_identity(
+            out_dir=dest_dir,
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:abc",
+            expected_dimension=1024,
+            client=None,
+        )
+
+
+def test_dimension_and_schema_version_reject_bool_and_non_integer_floats_regression_item_5(tmp_path):
+    """Finding 5 regression: dimension and schema_version reject bool and non-integer floats across switch_check, db, and build_v2."""
+    from db import _check_identity_conflict
+    from embedders import ModelIdentityError
+    from migrate_v2.build_v2 import validate_destination_persisted_identity
+
+    valid_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:abc",
+        "dimension": 1024,
+        "distance": "l2",
+        "normalization": False,
+    }
+
+    # 1. switch_check check_v2_identity rejects bool and non-integer floats
+    for bad_dim in [True, False, 1024.9]:
+        d_dir = tmp_path / f"dim_m_{type(bad_dim).__name__}_{bad_dim}"
+        d_dir.mkdir()
+        bad_m = dict(valid_id, dimension=bad_dim)
+        (d_dir / "graphify_manifest.json").write_text(json.dumps(bad_m), encoding="utf-8")
+        _create_mock_v2_sqlite(d_dir, metadata=valid_id)
+        res = check_v2_identity(d_dir)
+        assert res["status"] == "FAIL"
+        assert "dimension" in res["error"]
+
+        c_dir = tmp_path / f"dim_c_{type(bad_dim).__name__}_{bad_dim}"
+        c_dir.mkdir()
+        (c_dir / "graphify_manifest.json").write_text(json.dumps(valid_id), encoding="utf-8")
+        bad_c = dict(valid_id, dimension=bad_dim)
+        _create_mock_v2_sqlite(c_dir, metadata=bad_c)
+        res_c = check_v2_identity(c_dir)
+        assert res_c["status"] == "FAIL"
+        assert "dimension" in res_c["error"]
+
+    for bad_schema in [True, False, 2.5]:
+        s_dir = tmp_path / f"schema_m_{type(bad_schema).__name__}_{bad_schema}"
+        s_dir.mkdir()
+        bad_m = dict(valid_id, schema_version=bad_schema)
+        (s_dir / "graphify_manifest.json").write_text(json.dumps(bad_m), encoding="utf-8")
+        _create_mock_v2_sqlite(s_dir, metadata=valid_id)
+        res = check_v2_identity(s_dir)
+        assert res["status"] == "FAIL"
+        assert "schema_version" in res["error"]
+
+    # 2. _check_identity_conflict rejects bool and non-integer floats
+    for bad_dim in [True, 1024.9]:
+        with pytest.raises(ModelIdentityError, match="dimension"):
+            _check_identity_conflict(dict(valid_id, dimension=bad_dim), "manifest", valid_id, "kolleksiya")
+
+    for bad_schema in [True, 2.5]:
+        with pytest.raises(ModelIdentityError, match="schema_version"):
+            _check_identity_conflict(dict(valid_id, schema_version=bad_schema), "manifest", valid_id, "kolleksiya")
+
+    # 3. validate_destination_persisted_identity rejects bool and non-integer floats
+    v_dir = tmp_path / "val_dest_dim_float"
+    v_dir.mkdir()
+    (v_dir / "graphify_manifest.json").write_text(json.dumps(dict(valid_id, dimension=1024.9)), encoding="utf-8")
+    with pytest.raises(ModelIdentityError, match="dimension"):
+        validate_destination_persisted_identity(
+            out_dir=v_dir,
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:abc",
+            expected_dimension=1024,
+            client=None,
+        )
+
+    v_dir2 = tmp_path / "val_dest_dim_bool"
+    v_dir2.mkdir()
+    (v_dir2 / "graphify_manifest.json").write_text(json.dumps(dict(valid_id, dimension=True)), encoding="utf-8")
+    with pytest.raises(ModelIdentityError, match="dimension"):
+        validate_destination_persisted_identity(
+            out_dir=v_dir2,
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:abc",
+            expected_dimension=1024,
+            client=None,
+        )
+

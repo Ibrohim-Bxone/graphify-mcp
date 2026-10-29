@@ -1001,3 +1001,211 @@ def test_get_effective_space_reads_legacy_hnsw_configuration_before_metadata_reg
     # Fallback to metadata when config has no space
     assert get_effective_space({}, col_meta) == "l2"
 
+
+def test_validate_destination_persisted_identity_rejects_non_int_bool_and_negative_counts_regression_item_1(tmp_path):
+    """Finding 1 regression: col.count() returning bool, non-int, non-integer float, or negative count raises ModelIdentityError."""
+    from embedders import ModelIdentityError
+    from migrate_v2.build_v2 import validate_destination_persisted_identity
+
+    mock_client = Mock()
+    mock_col = Mock()
+    mock_col.metadata = {"model": "bge-m3", "model_digest": "sha256:f1", "dimension": 1024, "backend": "ollama"}
+    mock_client.get_collection.return_value = mock_col
+
+    for bad_cnt in [True, False, 10.5, -1, "invalid", None]:
+        mock_col.count.return_value = bad_cnt
+        with pytest.raises(ModelIdentityError, match="count"):
+            validate_destination_persisted_identity(
+                out_dir=tmp_path / "f1_bad_cnt",
+                col_name="graphify",
+                expected_model="bge-m3",
+                expected_digest="sha256:f1",
+                expected_dimension=1024,
+                client=mock_client,
+            )
+
+
+def test_validate_destination_persisted_identity_checks_distance_norm_schema_single_source_regression_item_2(tmp_path):
+    """Finding 2 regression: distance, normalization, and schema_version are compared with expected identity when only one source exists."""
+    from embedders import ModelIdentityError
+    from migrate_v2.build_v2 import validate_destination_persisted_identity
+
+    # Case A: Only manifest exists
+    m_dir = tmp_path / "f2_manifest_only"
+    m_dir.mkdir()
+    base_manifest = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:f2",
+        "dimension": 1024,
+        "distance": "l2",
+        "normalization": False,
+    }
+
+    # A1: Mismatched schema_version
+    m1 = dict(base_manifest, schema_version=1)
+    (m_dir / "graphify_manifest.json").write_text(json.dumps(m1), encoding="utf-8")
+    with pytest.raises(ModelIdentityError, match="schema_version mos kelmadi"):
+        validate_destination_persisted_identity(
+            out_dir=m_dir,
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:f2",
+            expected_dimension=1024,
+            client=None,
+        )
+
+    # A2: Mismatched normalization
+    m2 = dict(base_manifest, normalization=True)
+    (m_dir / "graphify_manifest.json").write_text(json.dumps(m2), encoding="utf-8")
+    with pytest.raises(ModelIdentityError, match="normalization mos kelmadi"):
+        validate_destination_persisted_identity(
+            out_dir=m_dir,
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:f2",
+            expected_dimension=1024,
+            client=None,
+        )
+
+    # A3: Mismatched distance
+    m3 = dict(base_manifest, distance="cosine")
+    (m_dir / "graphify_manifest.json").write_text(json.dumps(m3), encoding="utf-8")
+    with pytest.raises(ModelIdentityError, match="distance mos kelmadi"):
+        validate_destination_persisted_identity(
+            out_dir=m_dir,
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:f2",
+            expected_dimension=1024,
+            client=None,
+            expected_distance="l2",
+        )
+
+    # Case B: Only collection exists (no manifest)
+    mock_client = Mock()
+    mock_col = Mock()
+    mock_col.count.return_value = 5
+    mock_client.get_collection.return_value = mock_col
+
+    # B1: Collection mismatched schema_version
+    mock_col.metadata = dict(base_manifest, schema_version=1)
+    with pytest.raises(ModelIdentityError, match="schema_version mos kelmadi"):
+        validate_destination_persisted_identity(
+            out_dir=tmp_path / "f2_no_manifest",
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:f2",
+            expected_dimension=1024,
+            client=mock_client,
+        )
+
+    # B2: Collection mismatched normalization
+    mock_col.metadata = dict(base_manifest, normalization=True)
+    with pytest.raises(ModelIdentityError, match="normalization mos kelmadi"):
+        validate_destination_persisted_identity(
+            out_dir=tmp_path / "f2_no_manifest",
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:f2",
+            expected_dimension=1024,
+            client=mock_client,
+        )
+
+    # B3: Collection mismatched distance
+    mock_col.metadata = dict(base_manifest, distance="cosine")
+    with pytest.raises(ModelIdentityError, match="distance mos kelmadi"):
+        validate_destination_persisted_identity(
+            out_dir=tmp_path / "f2_no_manifest",
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:f2",
+            expected_dimension=1024,
+            client=mock_client,
+            expected_distance="l2",
+        )
+
+
+def test_unchanged_sync_rebuilds_when_completion_marker_identity_missing_or_mismatched_regression_item_3(tmp_path):
+    """Finding 3 regression: old build_complete.json identity fields validated against current build before restore; on mismatch or missing fields, rebuilds instead of restoring."""
+    v1_dir = tmp_path / "v1_item3"
+    v1_dir.mkdir()
+    create_mock_v1_db(v1_dir)
+    v2_dir = tmp_path / "v2_item3"
+    v2_dir.mkdir()
+
+    import chromadb
+    c_client = chromadb.PersistentClient(path=str(v2_dir))
+    fake_digest = "sha256:item3_digest"
+    fake_vec = [0.05] * 1024
+    dummy_ef = _DummyEF()
+
+    c_col = c_client.create_collection(
+        "graphify",
+        metadata={
+            "hnsw:space": "cosine",
+            "model": "bge-m3",
+            "model_digest": fake_digest,
+            "dimension": 1024,
+            "backend": "ollama",
+            "schema_version": 2,
+            "distance": "cosine",
+            "normalization": False,
+        },
+        embedding_function=dummy_ef,
+    )
+
+    from migrate_v2.build_v2 import read_v1_records, compute_corpus_hash
+    col_name, col_meta, col_config, v1_mtime, v1_records = read_v1_records(v1_dir)
+    corpus_hash = compute_corpus_hash(v1_records)
+
+    c_col.add(
+        ids=[r["id"] for r in v1_records],
+        embeddings=[fake_vec for _ in v1_records],
+        documents=[r["document"] for r in v1_records],
+        metadatas=[r["metadata"] for r in v1_records],
+    )
+
+    create_mock_keyword_index(v2_dir, v1_records)
+    kw_file = v2_dir / "keyword_index.sqlite3"
+    kw_mtime_gen = str(int(kw_file.stat().st_mtime))
+
+    manifest_data = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": fake_digest,
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+        "corpus_hash": corpus_hash,
+        "keyword_index_generation": kw_mtime_gen,
+        "total_records": len(v1_records),
+        "v1_sqlite_mtime": v1_mtime,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    # Complete data has missing identity fields (e.g., missing distance and normalization)
+    broken_complete_data = dict(manifest_data)
+    del broken_complete_data["distance"]
+    del broken_complete_data["normalization"]
+    broken_complete_data["timestamps"] = {"completed_at": "2026-10-28T12:00:00Z"}
+    complete_file = v2_dir / "build_complete.json"
+    complete_file.write_text(json.dumps(broken_complete_data), encoding="utf-8")
+
+    mock_embedder = Mock()
+    mock_embedder.encode.return_value = [fake_vec]
+
+    with patch("migrate_v2.build_v2.get_ollama_model_digest", return_value=fake_digest), \
+         patch("embedders.get_ollama_model_digest", return_value=fake_digest), \
+         patch("migrate_v2.build_v2.build_embedder", return_value=mock_embedder), \
+         patch("migrate_v2.build_v2.build_chroma_embedding_function", return_value=dummy_ef), \
+         patch("migrate_v2.build_v2.rebuild_keyword_index_subprocess") as mock_kw_rebuild:
+        run_sync(v1_dir, v2_dir)
+
+    assert mock_kw_rebuild.called, "rebuild_keyword_index_subprocess MUST be called when completion marker identity fields are missing!"
+    restored_marker = json.loads(complete_file.read_text(encoding="utf-8"))
+    assert "distance" in restored_marker and restored_marker["distance"] == "cosine"
+    assert "normalization" in restored_marker and restored_marker["normalization"] is False
+

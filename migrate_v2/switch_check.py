@@ -178,16 +178,44 @@ def check_v2_identity(v2_dir: Path) -> dict:
     except Exception as e:
         return {"status": "FAIL", "error": f"Baza kolleksiyasini o'qishda xatolik: {e}"}
 
-    from db import _check_identity_conflict
+    from db import _check_identity_conflict, _parse_int, _parse_bool
     from embedders import ModelIdentityError
 
-    c_backend = col_meta.get("backend") or col_meta.get("graphify:backend")
-    c_model = col_meta.get("model") or col_meta.get("graphify:model")
-    c_dim = col_meta.get("dimension") or col_meta.get("graphify:dimension")
-    c_digest = col_meta.get("model_digest") or col_meta.get("graphify:model_digest")
-    c_schema = col_meta.get("schema_version") or col_meta.get("graphify:schema_version")
-    c_dist = col_meta.get("distance") or col_meta.get("graphify:distance")
-    c_norm = col_meta.get("normalization") if col_meta.get("normalization") is not None else col_meta.get("graphify:normalization")
+    keys_to_extract = [
+        ("backend", str),
+        ("model", str),
+        ("dimension", _parse_int),
+        ("model_digest", str),
+        ("schema_version", _parse_int),
+        ("distance", str),
+        ("normalization", _parse_bool),
+    ]
+
+    resolved_c = {}
+    for key, cast_type in keys_to_extract:
+        val_plain = col_meta.get(key)
+        val_pref = col_meta.get(f"graphify:{key}")
+        if val_plain is not None and val_pref is not None:
+            differ = False
+            try:
+                c1 = cast_type(val_plain)
+                c2 = cast_type(val_pref)
+                differ = (c1 != c2)
+            except Exception:
+                differ = True
+            if differ:
+                return {"status": "FAIL", "error": f"Kolleksiyada '{key}' va 'graphify:{key}' qiymatlari mos kelmadi: {val_plain} != {val_pref}"}
+            resolved_c[key] = val_plain
+        else:
+            resolved_c[key] = val_plain if val_plain is not None else val_pref
+
+    c_backend = resolved_c["backend"]
+    c_model = resolved_c["model"]
+    c_dim = resolved_c["dimension"]
+    c_digest = resolved_c["model_digest"]
+    c_schema = resolved_c["schema_version"]
+    c_dist = resolved_c["distance"]
+    c_norm = resolved_c["normalization"]
 
     if not c_backend:
         return {"status": "FAIL", "error": "Baza kolleksiyasida 'backend' identifikatsiyasi topilmadi"}
@@ -204,13 +232,31 @@ def check_v2_identity(v2_dir: Path) -> dict:
     if c_norm is None:
         return {"status": "FAIL", "error": "Baza kolleksiyasida 'normalization' topilmadi"}
 
-    m_backend = manifest_identity.get("backend")
-    m_model = manifest_identity.get("model")
-    m_dim = manifest_identity.get("dimension")
-    m_digest = manifest_identity.get("model_digest")
-    m_schema = manifest_identity.get("schema_version")
-    m_dist = manifest_identity.get("distance")
-    m_norm = manifest_identity.get("normalization")
+    resolved_m = {}
+    for key, cast_type in keys_to_extract:
+        val_plain = manifest_identity.get(key)
+        val_pref = manifest_identity.get(f"graphify:{key}")
+        if val_plain is not None and val_pref is not None:
+            differ = False
+            try:
+                c1 = cast_type(val_plain)
+                c2 = cast_type(val_pref)
+                differ = (c1 != c2)
+            except Exception:
+                differ = True
+            if differ:
+                return {"status": "FAIL", "error": f"Manifestda '{key}' va 'graphify:{key}' qiymatlari mos kelmadi: {val_plain} != {val_pref}"}
+            resolved_m[key] = val_plain
+        else:
+            resolved_m[key] = val_plain if val_plain is not None else val_pref
+
+    m_backend = resolved_m["backend"]
+    m_model = resolved_m["model"]
+    m_dim = resolved_m["dimension"]
+    m_digest = resolved_m["model_digest"]
+    m_schema = resolved_m["schema_version"]
+    m_dist = resolved_m["distance"]
+    m_norm = resolved_m["normalization"]
 
     if not m_backend or str(m_backend).lower() != str(c_backend).lower():
         return {"status": "FAIL", "error": f"Backend mos kelmadi: manifest={m_backend}, kolleksiya={c_backend}"}
@@ -220,12 +266,12 @@ def check_v2_identity(v2_dir: Path) -> dict:
         return {"status": "FAIL", "error": "Manifestda 'dimension' topilmadi"}
 
     try:
-        m_dim_int = int(m_dim)
+        m_dim_int = _parse_int(m_dim)
     except (ValueError, TypeError, OverflowError):
         return {"status": "FAIL", "error": f"Manifestda 'dimension' noto'g'ri formatda: {m_dim}"}
 
     try:
-        c_dim_int = int(c_dim)
+        c_dim_int = _parse_int(c_dim)
     except (ValueError, TypeError, OverflowError):
         return {"status": "FAIL", "error": f"Baza kolleksiyasida 'dimension' noto'g'ri formatda: {c_dim}"}
 
@@ -239,10 +285,14 @@ def check_v2_identity(v2_dir: Path) -> dict:
         return {"status": "FAIL", "error": "Manifestda 'schema_version' topilmadi"}
 
     try:
-        m_schema_int = int(m_schema)
-        c_schema_int = int(c_schema)
+        m_schema_int = _parse_int(m_schema)
     except (ValueError, TypeError, OverflowError):
-        return {"status": "FAIL", "error": f"schema_version noto'g'ri formatda: manifest={m_schema}, kolleksiya={c_schema}"}
+        return {"status": "FAIL", "error": f"Manifestda 'schema_version' noto'g'ri formatda: {m_schema}"}
+
+    try:
+        c_schema_int = _parse_int(c_schema)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "FAIL", "error": f"Baza kolleksiyasida 'schema_version' noto'g'ri formatda: {c_schema}"}
 
     if m_schema_int != c_schema_int:
         return {"status": "FAIL", "error": f"schema_version mos kelmadi: manifest={m_schema}, kolleksiya={c_schema}"}

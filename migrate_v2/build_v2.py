@@ -207,15 +207,32 @@ def validate_destination_persisted_identity(
     expected_dimension: int,
     client=None,
     expected_backend: str = "ollama",
+    expected_schema_version: int = 2,
+    expected_distance: str = "l2",
+    expected_normalization: bool = False,
 ) -> None:
     """Validate that any persisted manifest and collection identity in out_dir matches expected model identity.
 
     Fails closed if:
     - manifest exists but is unreadable or malformed JSON
-    - manifest identity mismatches expected model, digest, dimension, or backend
-    - collection exists and has identity metadata that mismatches expected model, digest, dimension, or backend
+    - manifest identity mismatches expected model, digest, dimension, backend, distance, normalization, or schema_version
+    - collection exists and has identity metadata that mismatches expected values
     - manifest and collection metadata conflict with each other
+    - plain and prefixed graphify:* keys conflict within the same source
+    - collection count is bool, non-int, or negative
     """
+    from db import _parse_int, _parse_bool
+
+    keys_to_extract = [
+        ("backend", str),
+        ("model", str),
+        ("dimension", _parse_int),
+        ("model_digest", str),
+        ("schema_version", _parse_int),
+        ("distance", str),
+        ("normalization", _parse_bool),
+    ]
+
     manifest_meta = {}
     manifest_file = out_dir / "graphify_manifest.json"
     if manifest_file.exists():
@@ -228,10 +245,33 @@ def validate_destination_persisted_identity(
         if not isinstance(manifest_meta, dict):
             raise ModelIdentityError("Sync rad etildi: Destination manifest fayli yaroqsiz (JSON lug'at emas)")
 
-        m_backend = manifest_meta.get("backend")
-        m_model = manifest_meta.get("model")
-        m_digest = manifest_meta.get("model_digest")
-        m_dim = manifest_meta.get("dimension")
+        resolved_m = {}
+        for key, cast_type in keys_to_extract:
+            val_plain = manifest_meta.get(key)
+            val_pref = manifest_meta.get(f"graphify:{key}")
+            if val_plain is not None and val_pref is not None:
+                differ = False
+                try:
+                    c1 = cast_type(val_plain)
+                    c2 = cast_type(val_pref)
+                    differ = (c1 != c2)
+                except Exception:
+                    differ = True
+                if differ:
+                    raise ModelIdentityError(
+                        f"Sync rad etildi: Destination manifestda '{key}' va 'graphify:{key}' qiymatlari mos kelmadi: {val_plain} != {val_pref}"
+                    )
+                resolved_m[key] = val_plain
+            else:
+                resolved_m[key] = val_plain if val_plain is not None else val_pref
+
+        m_backend = resolved_m.get("backend")
+        m_model = resolved_m.get("model")
+        m_digest = resolved_m.get("model_digest")
+        m_dim = resolved_m.get("dimension")
+        m_schema = resolved_m.get("schema_version")
+        m_dist = resolved_m.get("distance")
+        m_norm = resolved_m.get("normalization")
 
         if not m_model or m_model != expected_model:
             raise ModelIdentityError(
@@ -242,7 +282,7 @@ def validate_destination_persisted_identity(
                 f"Sync rad etildi: Destination manifest model_digest mos kelmadi: mavjud={m_digest}, kutilgan={expected_digest}"
             )
         try:
-            m_dim_int = int(m_dim) if m_dim is not None else None
+            m_dim_int = _parse_int(m_dim) if m_dim is not None else None
         except (ValueError, TypeError, OverflowError):
             m_dim_int = None
         if m_dim_int != expected_dimension:
@@ -253,6 +293,31 @@ def validate_destination_persisted_identity(
             raise ModelIdentityError(
                 f"Sync rad etildi: Destination manifest backend mos kelmadi yoki yo'q: mavjud={m_backend}, kutilgan={expected_backend}"
             )
+        if m_schema is not None:
+            try:
+                m_schema_int = _parse_int(m_schema)
+            except (ValueError, TypeError, OverflowError):
+                m_schema_int = None
+            if m_schema_int != expected_schema_version:
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination manifest schema_version mos kelmadi: mavjud={m_schema}, kutilgan={expected_schema_version}"
+                )
+        if m_dist is not None and expected_distance is not None:
+            if not isinstance(m_dist, str) or m_dist.strip().lower() != expected_distance.strip().lower():
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination manifest distance mos kelmadi: mavjud={m_dist}, kutilgan={expected_distance}"
+                )
+        if m_norm is not None:
+            try:
+                m_norm_bool = _parse_bool(m_norm)
+            except (ValueError, TypeError):
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination manifest normalization noto'g'ri formatda: {m_norm}"
+                )
+            if m_norm_bool != expected_normalization:
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination manifest normalization mos kelmadi: mavjud={m_norm}, kutilgan={expected_normalization}"
+                )
 
     col_meta = {}
     col_count = 0
@@ -263,7 +328,13 @@ def validate_destination_persisted_identity(
                 if isinstance(getattr(col, "metadata", None), dict):
                     col_meta = col.metadata
                 cnt = col.count()
-                col_count = int(cnt) if isinstance(cnt, (int, float)) else 0
+                if isinstance(cnt, bool) or not isinstance(cnt, int) or cnt < 0:
+                    raise ModelIdentityError(
+                        f"Sync rad etildi: Destination kolleksiya count yaroqsiz (bool, butun son emas yoki manfiy): {cnt!r}"
+                    )
+                col_count = cnt
+        except ModelIdentityError:
+            raise
         except Exception as e:
             from db import _is_absent_collection_error
             if not _is_absent_collection_error(e):
@@ -308,7 +379,12 @@ def validate_destination_persisted_identity(
                         """, (col_id,))
                         cnt_row = cur.fetchone()
                         if cnt_row:
-                            col_count = cnt_row[0]
+                            cnt = cnt_row[0]
+                            if isinstance(cnt, bool) or not isinstance(cnt, int) or cnt < 0:
+                                raise ModelIdentityError(
+                                    f"Sync rad etildi: Destination kolleksiya count yaroqsiz (bool, butun son emas yoki manfiy): {cnt!r}"
+                                )
+                            col_count = cnt
                 finally:
                     conn.close()
             except sqlite3.OperationalError:
@@ -316,12 +392,36 @@ def validate_destination_persisted_identity(
             except Exception:
                 raise
 
-    if isinstance(col_count, (int, float)) and col_count > 0:
-        c_backend = col_meta.get("backend") or col_meta.get("graphify:backend")
-        c_model = col_meta.get("model") or col_meta.get("graphify:model")
-        c_digest = col_meta.get("model_digest") or col_meta.get("graphify:model_digest")
-        c_dim = col_meta.get("dimension") or col_meta.get("graphify:dimension")
+    resolved_c = {}
+    if col_meta:
+        for key, cast_type in keys_to_extract:
+            val_plain = col_meta.get(key)
+            val_pref = col_meta.get(f"graphify:{key}")
+            if val_plain is not None and val_pref is not None:
+                differ = False
+                try:
+                    c1 = cast_type(val_plain)
+                    c2 = cast_type(val_pref)
+                    differ = (c1 != c2)
+                except Exception:
+                    differ = True
+                if differ:
+                    raise ModelIdentityError(
+                        f"Sync rad etildi: Destination kolleksiyada '{key}' va 'graphify:{key}' qiymatlari mos kelmadi: {val_plain} != {val_pref}"
+                    )
+                resolved_c[key] = val_plain
+            else:
+                resolved_c[key] = val_plain if val_plain is not None else val_pref
 
+    c_backend = resolved_c.get("backend")
+    c_model = resolved_c.get("model")
+    c_digest = resolved_c.get("model_digest")
+    c_dim = resolved_c.get("dimension")
+    c_schema = resolved_c.get("schema_version")
+    c_dist = resolved_c.get("distance")
+    c_norm = resolved_c.get("normalization")
+
+    if col_count > 0:
         if not c_model or c_model != expected_model:
             raise ModelIdentityError(
                 f"Sync rad etildi: Destination kolleksiyada yozuvlar mavjud, ammo model mos kelmadi yoki yo'q: mavjud={c_model}, kutilgan={expected_model}"
@@ -331,7 +431,7 @@ def validate_destination_persisted_identity(
                 f"Sync rad etildi: Destination kolleksiyada yozuvlar mavjud, ammo model_digest mos kelmadi yoki yo'q: mavjud={c_digest}, kutilgan={expected_digest}"
             )
         try:
-            c_dim_int = int(c_dim) if c_dim is not None else None
+            c_dim_int = _parse_int(c_dim) if c_dim is not None else None
         except (ValueError, TypeError, OverflowError):
             c_dim_int = None
         if c_dim_int != expected_dimension:
@@ -342,12 +442,32 @@ def validate_destination_persisted_identity(
             raise ModelIdentityError(
                 f"Sync rad etildi: Destination kolleksiyada yozuvlar mavjud, ammo backend mos kelmadi yoki yo'q: mavjud={c_backend}, kutilgan={expected_backend}"
             )
+        if c_schema is not None:
+            try:
+                c_schema_int = _parse_int(c_schema)
+            except (ValueError, TypeError, OverflowError):
+                c_schema_int = None
+            if c_schema_int != expected_schema_version:
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination kolleksiya schema_version mos kelmadi: mavjud={c_schema}, kutilgan={expected_schema_version}"
+                )
+        if c_dist is not None and expected_distance is not None:
+            if not isinstance(c_dist, str) or c_dist.strip().lower() != expected_distance.strip().lower():
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination kolleksiya distance mos kelmadi: mavjud={c_dist}, kutilgan={expected_distance}"
+                )
+        if c_norm is not None:
+            try:
+                c_norm_bool = _parse_bool(c_norm)
+            except (ValueError, TypeError):
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination kolleksiya normalization noto'g'ri formatda: {c_norm}"
+                )
+            if c_norm_bool != expected_normalization:
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination kolleksiya normalization mos kelmadi: mavjud={c_norm}, kutilgan={expected_normalization}"
+                )
     elif col_meta:
-        c_backend = col_meta.get("backend") or col_meta.get("graphify:backend")
-        c_model = col_meta.get("model") or col_meta.get("graphify:model")
-        c_digest = col_meta.get("model_digest") or col_meta.get("graphify:model_digest")
-        c_dim = col_meta.get("dimension") or col_meta.get("graphify:dimension")
-
         if c_model and c_model != expected_model:
             raise ModelIdentityError(
                 f"Sync rad etildi: Destination kolleksiya model mos kelmadi: mavjud={c_model}, kutilgan={expected_model}"
@@ -357,7 +477,7 @@ def validate_destination_persisted_identity(
                 f"Sync rad etildi: Destination kolleksiya model_digest mos kelmadi: mavjud={c_digest}, kutilgan={expected_digest}"
             )
         try:
-            c_dim_int = int(c_dim) if c_dim is not None else None
+            c_dim_int = _parse_int(c_dim) if c_dim is not None else None
         except (ValueError, TypeError, OverflowError):
             c_dim_int = None
         if c_dim is not None and c_dim_int != expected_dimension:
@@ -370,8 +490,7 @@ def validate_destination_persisted_identity(
             or c_digest
             or c_dim is not None
             or c_backend
-            or col_meta.get("schema_version") is not None
-            or col_meta.get("graphify:schema_version") is not None
+            or c_schema is not None
         )
         if has_identity:
             if not c_backend or c_backend != expected_backend:
@@ -382,6 +501,31 @@ def validate_destination_persisted_identity(
             raise ModelIdentityError(
                 f"Sync rad etildi: Destination kolleksiya backend mos kelmadi: mavjud={c_backend}, kutilgan={expected_backend}"
             )
+        if c_schema is not None:
+            try:
+                c_schema_int = _parse_int(c_schema)
+            except (ValueError, TypeError, OverflowError):
+                c_schema_int = None
+            if c_schema_int != expected_schema_version:
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination kolleksiya schema_version mos kelmadi: mavjud={c_schema}, kutilgan={expected_schema_version}"
+                )
+        if c_dist is not None and expected_distance is not None:
+            if not isinstance(c_dist, str) or c_dist.strip().lower() != expected_distance.strip().lower():
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination kolleksiya distance mos kelmadi: mavjud={c_dist}, kutilgan={expected_distance}"
+                )
+        if c_norm is not None:
+            try:
+                c_norm_bool = _parse_bool(c_norm)
+            except (ValueError, TypeError):
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination kolleksiya normalization noto'g'ri formatda: {c_norm}"
+                )
+            if c_norm_bool != expected_normalization:
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination kolleksiya normalization mos kelmadi: mavjud={c_norm}, kutilgan={expected_normalization}"
+                )
 
     if manifest_meta and col_meta:
         from db import _check_identity_conflict
@@ -568,6 +712,41 @@ def write_build_complete_atomic(out_dir: Path, identity: dict, started_at) -> No
     os.replace(tmp_path, final_path)
 
 
+def _validate_completion_marker_identity(marker_data: dict, current_identity: dict) -> bool:
+    """Validate completion marker identity fields against current build. Return True if valid, False if mismatch or missing."""
+    if not isinstance(marker_data, dict):
+        return False
+    from db import _parse_int, _parse_bool
+    keys = ["model", "model_digest", "dimension", "backend", "distance", "normalization", "schema_version"]
+    for k in keys:
+        if k not in marker_data or marker_data[k] is None:
+            return False
+    if marker_data.get("model") != current_identity.get("model"):
+        return False
+    if marker_data.get("model_digest") != current_identity.get("model_digest"):
+        return False
+    try:
+        if _parse_int(marker_data.get("dimension")) != _parse_int(current_identity.get("dimension")):
+            return False
+    except (ValueError, TypeError, OverflowError):
+        return False
+    if str(marker_data.get("backend")).lower() != str(current_identity.get("backend")).lower():
+        return False
+    if str(marker_data.get("distance")).lower() != str(current_identity.get("distance")).lower():
+        return False
+    try:
+        if _parse_bool(marker_data.get("normalization")) != _parse_bool(current_identity.get("normalization", False)):
+            return False
+    except (ValueError, TypeError):
+        return False
+    try:
+        if _parse_int(marker_data.get("schema_version")) != _parse_int(current_identity.get("schema_version")):
+            return False
+    except (ValueError, TypeError, OverflowError):
+        return False
+    return True
+
+
 def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int = 8) -> None:
     """Compare destination document+metadata hashes, re-embed/upsert changed ids, delete removed ids.
 
@@ -597,6 +776,7 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         expected_digest=model_digest,
         expected_dimension=EXPECTED_DIMENSION,
         client=None,
+        expected_distance=col_meta.get("hnsw:space", "l2"),
     )
 
     # Invalidate completion status before the first destination mutation (Finding 3 & TOPILMA 5)
@@ -624,6 +804,7 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         "model_digest": model_digest,
         "dimension": EXPECTED_DIMENSION,
         "distance": space,
+        "normalization": False,
     }
     embed_fn = build_chroma_embedding_function(identity=sync_identity)
     col = client.get_or_create_collection(
@@ -687,6 +868,7 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
                 or m_check.get("keyword_index_generation") != kw_mtime_gen
                 or c_check.get("corpus_hash") != corpus_hash
                 or c_check.get("keyword_index_generation") != kw_mtime_gen
+                or not _validate_completion_marker_identity(c_check, sync_identity)
             ):
                 needs_rebuild = True
         except Exception:
@@ -695,15 +877,19 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
     if not to_upsert and not to_delete and not needs_rebuild:
         try:
             verify_v2(col, v1_records, out_dir)
-            if complete_data_backup:
+            if complete_data_backup and _validate_completion_marker_identity(complete_data_backup, sync_identity):
                 tmp_path = out_dir / "build_complete.json.tmp"
                 with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(complete_data_backup, f, indent=2, ensure_ascii=False)
                 os.replace(tmp_path, complete_file)
-            else:
+                print("[sync] Baza allaqachon to'liq sinxron holatda va tasdiqlangan.", flush=True)
+                return
+            elif not complete_data_backup:
                 write_build_complete_atomic(out_dir, sync_identity, started_at)
-            print("[sync] Baza allaqachon to'liq sinxron holatda va tasdiqlangan.", flush=True)
-            return
+                print("[sync] Baza allaqachon to'liq sinxron holatda va tasdiqlangan.", flush=True)
+                return
+            else:
+                needs_rebuild = True
         except Exception:
             needs_rebuild = True
 
@@ -820,6 +1006,7 @@ def main():
         expected_digest=model_digest,
         expected_dimension=EXPECTED_DIMENSION,
         client=None,
+        expected_distance=col_meta.get("hnsw:space", "l2"),
     )
 
     # Remove completion marker before first mutation, keyword rebuild, or manifest update
