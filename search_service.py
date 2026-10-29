@@ -15,9 +15,14 @@ def retrieve(query, *, top_k=5, projects=None, where=None, collection, kw_index,
     top_k = max(1, min(int(top_k), 30))
     variants = search_policy.query_variants(query)
     scores = defaultdict(float); hits = {}; related = {}
+    primary_res = None
+    all_results = []
     for variant in variants:
         res = search_core.hybrid_search(query=variant, top_k=top_k, where=where,
                                        collection=collection, kw_index=kw_index, min_similarity=min_similarity)
+        if primary_res is None:
+            primary_res = res
+        all_results.append(res)
         for rank, item in enumerate(res['results']):
             key = search_policy.source_key(item.get('meta') or {})
             # Rewrites of one question are alternatives, not independent votes.
@@ -32,8 +37,26 @@ def retrieve(query, *, top_k=5, projects=None, where=None, collection, kw_index,
     ranked = sorted(hits, key=lambda key: scores[key], reverse=True)
     chosen = ranked[:top_k]
     candidates = [hits[key] for key in ranked[top_k:]] + [item for key, item in related.items() if key not in hits]
+    rerank_statuses = [r.get('rerank', 'off') for r in all_results]
+    if 'unavailable' in rerank_statuses:
+        final_rerank = 'unavailable'
+        reasons = [r.get('rerank_reason') for r in all_results if r.get('rerank') == 'unavailable' and r.get('rerank_reason')]
+        if not reasons:
+            reasons = [r.get('rerank_reason') for r in all_results if r.get('rerank_reason')]
+        final_reason = '; '.join(dict.fromkeys(reasons)) if reasons else 'rerank unavailable'
+    elif 'on' in rerank_statuses:
+        final_rerank = 'on'
+        final_reason = None
+    elif 'off' in rerank_statuses:
+        final_rerank = 'off'
+        reasons = [r.get('rerank_reason') for r in all_results if r.get('rerank_reason')]
+        final_reason = reasons[0] if reasons else None
+    else:
+        final_rerank = 'off'
+        final_reason = None
     return dict(status='ok' if chosen else 'insufficient_evidence', queries=variants,
-                results=[hits[key] for key in chosen], related_candidates=candidates)
+                results=[hits[key] for key in chosen], related_candidates=candidates,
+                rerank=final_rerank, rerank_reason=final_reason)
 
 
 def factory_context(query, project, *, collection, kw_index, top_k=5, max_chars=10000):
