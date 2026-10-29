@@ -66,17 +66,41 @@ def get_db_mtime() -> float:
 
 def _check_identity_conflict(source_a: dict, name_a: str, source_b: dict, name_b: str) -> None:
     """Compares key identity fields between two sources and raises ModelIdentityError on mismatch."""
+    def _parse_bool(val):
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, int) and val in (0, 1):
+            return bool(val)
+        s = str(val).strip().lower()
+        if s in ("true", "1"):
+            return True
+        if s in ("false", "0"):
+            return False
+        raise ValueError(f"Noto'g'ri boolean qiymat: {val}")
+
     keys_to_compare = [
+        ("schema_version", int),
+        ("backend", str),
         ("model", str),
         ("model_digest", str),
         ("dimension", int),
-        ("backend", str),
+        ("distance", str),
+        ("normalization", _parse_bool),
     ]
     for key, cast_type in keys_to_compare:
         val_a = source_a.get(key) if source_a.get(key) is not None else source_a.get(f"graphify:{key}")
         val_b = source_b.get(key) if source_b.get(key) is not None else source_b.get(f"graphify:{key}")
         if val_a is not None and val_b is not None:
-            if cast_type(val_a) != cast_type(val_b):
+            try:
+                c_a = cast_type(val_a)
+                c_b = cast_type(val_b)
+            except (ValueError, TypeError, OverflowError) as e:
+                from embedders import ModelIdentityError
+                raise ModelIdentityError(
+                    f"Model identifikatsiyasi nomuvofiq ({name_a} vs {name_b}): "
+                    f"{key} qiymatini o'qib bo'lmadi ({val_a} vs {val_b})"
+                ) from e
+            if c_a != c_b:
                 from embedders import ModelIdentityError
                 raise ModelIdentityError(
                     f"Model identifikatsiyasi nomuvofiq ({name_a} vs {name_b}): "
@@ -209,31 +233,39 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
                 conn = sqlite3.connect(f"file:{sqlite_file.as_posix()}?mode=ro", uri=True, timeout=5.0)
                 try:
                     cur = conn.cursor()
-                    cur.execute("""
-                        SELECT m.key, m.str_value, m.int_value, m.float_value, m.bool_value
-                        FROM collection_metadata m
-                        JOIN collections c ON m.collection_id = c.id
-                        WHERE c.name = ?
-                    """, (COLLECTION,))
-                    rows = cur.fetchall()
-                    if rows:
-                        s_meta = {}
-                        for k, s, i, f, b in rows:
-                            val = bool(b) if b is not None else i if i is not None else f if f is not None else s
-                            s_meta[k] = val
-                        if (
-                            s_meta.get("schema_version") == 2
-                            or s_meta.get("graphify:schema_version") == 2
-                            or "model_digest" in s_meta
-                            or "graphify:model_digest" in s_meta
-                            or "model" in s_meta
-                        ):
-                            col_meta.update(s_meta)
+                    try:
+                        cur.execute("SELECT id FROM collections WHERE name = ?", (COLLECTION,))
+                        c_row = cur.fetchone()
+                    except sqlite3.OperationalError as e:
+                        if "no such table" in str(e).lower():
+                            c_row = None
+                        else:
+                            raise
+
+                    if c_row is not None:
+                        cur.execute("""
+                            SELECT m.key, m.str_value, m.int_value, m.float_value, m.bool_value
+                            FROM collection_metadata m
+                            WHERE m.collection_id = ?
+                        """, (c_row[0],))
+                        rows = cur.fetchall()
+                        if rows:
+                            s_meta = {}
+                            for k, s, i, f, b in rows:
+                                val = bool(b) if b is not None else i if i is not None else f if f is not None else s
+                                s_meta[k] = val
+                            if (
+                                s_meta.get("schema_version") == 2
+                                or s_meta.get("graphify:schema_version") == 2
+                                or "model_digest" in s_meta
+                                or "graphify:model_digest" in s_meta
+                                or "model" in s_meta
+                            ):
+                                col_meta.update(s_meta)
                 finally:
                     conn.close()
-            except sqlite3.OperationalError as e:
-                if "no such table" not in str(e).lower():
-                    raise
+            except sqlite3.OperationalError:
+                raise
             except Exception:
                 raise
 

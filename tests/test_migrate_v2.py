@@ -701,3 +701,303 @@ def test_eval_v2_generates_dynamic_comparative_sentences_when_v2_beats_v1_and_eq
     assert "Gate 0.8 dan 0.0 ga tushirilganda bge-m3 MRR ko'rsatkichi 0.80 dan 0.90 ga ortdi" in content
     assert "bge-m3 asosiy embedder sifatida tavsiya etiladi" in content
 
+
+def test_build_v2_modify_strips_hnsw_keys_regression_finding_1(tmp_path):
+    """Finding 1 regression: merged_metadata containing hnsw:* keys has them stripped before col.modify, preserving space without error."""
+    import chromadb
+    client = chromadb.PersistentClient(path=str(tmp_path))
+    col = client.create_collection("graphify", metadata={"hnsw:space": "cosine"})
+
+    # 1. Directly passing hnsw:space to modify raises ValueError in Chroma 1.5.9
+    with pytest.raises(ValueError, match="Changing the distance function"):
+        col.modify(metadata={"hnsw:space": "cosine", "model": "bge-m3"})
+
+    # 2. Stripping hnsw:* keys succeeds and keeps space in configuration_json
+    merged_metadata = {
+        "hnsw:space": "cosine",
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:digest_f1",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+    modify_meta = {
+        k: v for k, v in {
+            **(col.metadata if isinstance(col.metadata, dict) else {}),
+            **merged_metadata,
+        }.items()
+        if not k.startswith("hnsw:")
+    }
+    col.modify(metadata=modify_meta)
+    assert col.metadata.get("model") == "bge-m3"
+    assert col.metadata.get("dimension") == 1024
+    assert col.configuration_json["hnsw"]["space"] == "cosine"
+
+
+def test_sync_and_build_validate_read_only_before_client_init_regression_finding_2(tmp_path):
+    """Finding 2 regression: validate manifest and persisted identity read-only (sqlite mode=ro) first, rejecting unreadable/conflicting manifest before PersistentClient is constructed."""
+    v1_dir = tmp_path / "v1_f2"
+    v1_dir.mkdir()
+    create_mock_v1_db(v1_dir)
+    v2_dir = tmp_path / "v2_f2"
+    v2_dir.mkdir()
+
+    # Corrupt/unreadable manifest
+    bad_manifest = v2_dir / "graphify_manifest.json"
+    bad_manifest.write_text("{invalid json", encoding="utf-8")
+
+    from embedders import ModelIdentityError
+    with patch("migrate_v2.build_v2.get_ollama_model_digest", return_value="sha256:f2"):
+        with pytest.raises(ModelIdentityError, match="Destination manifest fayli o'qib bo'lmadi"):
+            run_sync(v1_dir, v2_dir)
+
+    # PersistentClient was never called, so chroma.sqlite3 was never created!
+    assert not (v2_dir / "chroma.sqlite3").exists()
+
+
+def test_sync_removes_build_complete_marker_before_first_metadata_mutation_regression_finding_3(tmp_path):
+    """Finding 3 regression: sync removes build_complete.json after validation and before the first destination mutation."""
+    v1_dir = tmp_path / "v1_f3"
+    v1_dir.mkdir()
+    create_mock_v1_db(v1_dir)
+    v2_dir = tmp_path / "v2_f3"
+    v2_dir.mkdir()
+
+    # Pre-create a marker
+    marker = v2_dir / "build_complete.json"
+    marker.write_text(json.dumps({"status": "previous_complete"}), encoding="utf-8")
+
+    fake_digest = "sha256:f3_digest"
+    # Cause failure right during col.modify (first mutation)
+    mock_client = Mock()
+    mock_col = Mock()
+    mock_col.metadata = {}
+    mock_col.modify.side_effect = RuntimeError("Forced modify failure")
+    mock_client.get_or_create_collection.return_value = mock_col
+    with patch("migrate_v2.build_v2.get_ollama_model_digest", return_value=fake_digest):
+        with patch("migrate_v2.build_v2.build_chroma_embedding_function", return_value=_DummyEF()):
+            with patch("chromadb.PersistentClient", return_value=mock_client):
+                with pytest.raises(RuntimeError, match="Forced modify failure"):
+                    run_sync(v1_dir, v2_dir)
+
+    # Marker must have been removed BEFORE the mutation attempt and must not exist
+    assert not marker.exists(), "build_complete.json must be removed before first mutation and not remain on failure!"
+
+
+def test_validate_destination_persisted_identity_propagates_count_exception_regression_finding_4(tmp_path):
+    """Finding 4 regression: col.count() exception propagates instead of setting col_count = 0."""
+    from migrate_v2.build_v2 import validate_destination_persisted_identity
+    mock_client = Mock()
+    mock_col = Mock()
+    mock_col.metadata = {"model": "bge-m3", "model_digest": "sha256:f4", "dimension": 1024, "backend": "ollama"}
+    mock_col.count.side_effect = RuntimeError("Database disk image is malformed")
+    mock_client.get_collection.return_value = mock_col
+
+    with pytest.raises(RuntimeError, match="Database disk image is malformed"):
+        validate_destination_persisted_identity(
+            out_dir=Path("/nonexistent"),
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:f4",
+            expected_dimension=1024,
+            client=mock_client,
+        )
+
+    # TOPILMA 1: SQLite count error with client=None must propagate when embeddings table is missing
+    dest_dir = tmp_path / "f4_sqlite_count_err"
+    dest_dir.mkdir()
+    db_file = dest_dir / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_file))
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE collections (id TEXT, name TEXT);")
+    cur.execute("CREATE TABLE collection_metadata (collection_id TEXT, key TEXT, str_value TEXT, int_value INT, float_value REAL, bool_value INT);")
+    cur.execute("INSERT INTO collections VALUES ('c1', 'graphify');")
+    cur.execute("INSERT INTO collection_metadata VALUES ('c1', 'model', 'bge-m3', NULL, NULL, NULL);")
+    cur.execute("INSERT INTO collection_metadata VALUES ('c1', 'model_digest', 'sha256:f4', NULL, NULL, NULL);")
+    cur.execute("INSERT INTO collection_metadata VALUES ('c1', 'dimension', NULL, 1024, NULL, NULL);")
+    cur.execute("INSERT INTO collection_metadata VALUES ('c1', 'backend', 'ollama', NULL, NULL, NULL);")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        validate_destination_persisted_identity(
+            out_dir=dest_dir,
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:f4",
+            expected_dimension=1024,
+            client=None,
+        )
+
+
+def test_validate_destination_persisted_identity_checks_backend_in_both_sources_regression_finding_5(tmp_path):
+    """Finding 5 regression: destination validation requires and validates backend in both manifest and collection."""
+    from embedders import ModelIdentityError
+    from migrate_v2.build_v2 import validate_destination_persisted_identity
+
+    # 1. Manifest missing backend
+    out_dir = tmp_path / "f5_manifest_no_backend"
+    out_dir.mkdir()
+    (out_dir / "graphify_manifest.json").write_text(json.dumps({
+        "schema_version": 2,
+        "model": "bge-m3",
+        "model_digest": "sha256:f5",
+        "dimension": 1024,
+    }), encoding="utf-8")
+    with pytest.raises(ModelIdentityError, match="backend mos kelmadi yoki yo'q"):
+        validate_destination_persisted_identity(
+            out_dir=out_dir,
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:f5",
+            expected_dimension=1024,
+            client=None,
+        )
+
+    # 2. Manifest with conflicting backend
+    (out_dir / "graphify_manifest.json").write_text(json.dumps({
+        "schema_version": 2,
+        "backend": "local",
+        "model": "bge-m3",
+        "model_digest": "sha256:f5",
+        "dimension": 1024,
+    }), encoding="utf-8")
+    with pytest.raises(ModelIdentityError, match="backend mos kelmadi yoki yo'q"):
+        validate_destination_persisted_identity(
+            out_dir=out_dir,
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:f5",
+            expected_dimension=1024,
+            client=None,
+        )
+
+    # 3. Collection with records missing backend
+    mock_client = Mock()
+    mock_col = Mock()
+    mock_col.metadata = {"model": "bge-m3", "model_digest": "sha256:f5", "dimension": 1024}
+    mock_col.count.return_value = 5
+    mock_client.get_collection.return_value = mock_col
+    dest_dir = tmp_path / "f5_col_no_backend"
+    dest_dir.mkdir()
+    with pytest.raises(ModelIdentityError, match="backend mos kelmadi yoki yo'q"):
+        validate_destination_persisted_identity(
+            out_dir=dest_dir,
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:f5",
+            expected_dimension=1024,
+            client=mock_client,
+        )
+
+    # 4. TOPILMA 4: Empty collection (0 records) with model/digest/dimension but missing backend
+    mock_client_empty = Mock()
+    mock_col_empty = Mock()
+    mock_col_empty.metadata = {"model": "bge-m3", "model_digest": "sha256:f5", "dimension": 1024}
+    mock_col_empty.count.return_value = 0
+    mock_client_empty.get_collection.return_value = mock_col_empty
+    dest_dir_empty = tmp_path / "f5_empty_col_no_backend"
+    dest_dir_empty.mkdir()
+    with pytest.raises(ModelIdentityError, match="backend mos kelmadi yoki yo'q"):
+        validate_destination_persisted_identity(
+            out_dir=dest_dir_empty,
+            col_name="graphify",
+            expected_model="bge-m3",
+            expected_digest="sha256:f5",
+            expected_dimension=1024,
+            client=mock_client_empty,
+        )
+
+
+def test_unchanged_sync_skips_keyword_rebuild_and_restores_completion_marker_topilma_5(tmp_path):
+    """TOPILMA 5: Unchanged sync validates, skips keyword index rebuild, and restores build_complete.json."""
+    v1_dir = tmp_path / "v1_topilma5"
+    v1_dir.mkdir()
+    create_mock_v1_db(v1_dir)
+    v2_dir = tmp_path / "v2_topilma5"
+    v2_dir.mkdir()
+
+    import chromadb
+    client = chromadb.PersistentClient(path=str(v2_dir))
+    fake_digest = "sha256:topilma5_digest"
+    fake_vec = [0.1] * 1024
+    dummy_ef = _DummyEF()
+
+    from migrate_v2.build_v2 import compute_corpus_hash, read_v1_records
+    from keyword_index import tokenize
+    _, _, _, v1_mtime, v1_records = read_v1_records(v1_dir)
+    corpus_hash = compute_corpus_hash(v1_records)
+
+    col = client.create_collection("graphify", metadata={"hnsw:space": "cosine", "model": "bge-m3", "model_digest": fake_digest, "dimension": 1024, "backend": "ollama", "schema_version": 2, "distance": "cosine"}, embedding_function=dummy_ef)
+    for r in v1_records:
+        col.add(ids=[r["id"]], documents=[r["document"]], metadatas=[r["metadata"] if r["metadata"] else None], embeddings=[fake_vec])
+
+    kw_file = v2_dir / "keyword_index.sqlite3"
+    conn = sqlite3.connect(str(kw_file))
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, project TEXT, kind TEXT, parent_id TEXT, token_count INT, text TEXT);")
+    cur.execute("CREATE VIRTUAL TABLE fts_idx USING fts5(id UNINDEXED, text);")
+    for r in v1_records:
+        text = r["document"] or ""
+        meta = r["metadata"] or {}
+        tokens = tokenize((meta.get("title") or "") + "\n" + text)
+        cur.execute("INSERT INTO docs VALUES (?, ?, ?, ?, ?, ?)", (r["id"], "", "", "", len(tokens), text))
+        cur.execute("INSERT INTO fts_idx VALUES (?, ?)", (r["id"], " ".join(tokens)))
+    conn.commit()
+    conn.close()
+
+    kw_mtime_gen = str(int(kw_file.stat().st_mtime))
+
+    manifest_data = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": fake_digest,
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+        "corpus_hash": corpus_hash,
+        "keyword_index_generation": kw_mtime_gen,
+        "total_records": len(v1_records),
+        "v1_sqlite_mtime": v1_mtime,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    complete_data = dict(manifest_data)
+    complete_data["timestamps"] = {"completed_at": "2026-10-28T12:00:00Z"}
+    complete_file = v2_dir / "build_complete.json"
+    complete_file.write_text(json.dumps(complete_data), encoding="utf-8")
+
+    mock_embedder = Mock()
+    mock_embedder.encode.return_value = [fake_vec]
+
+    with patch("migrate_v2.build_v2.get_ollama_model_digest", return_value=fake_digest), \
+         patch("embedders.get_ollama_model_digest", return_value=fake_digest), \
+         patch("migrate_v2.build_v2.build_embedder", return_value=mock_embedder), \
+         patch("migrate_v2.build_v2.build_chroma_embedding_function", return_value=dummy_ef), \
+         patch("migrate_v2.build_v2.rebuild_keyword_index_subprocess") as mock_kw_rebuild:
+        run_sync(v1_dir, v2_dir)
+
+    assert not mock_kw_rebuild.called, "rebuild_keyword_index_subprocess should NOT be called on unchanged sync!"
+    assert complete_file.exists(), "build_complete.json must exist after unchanged sync!"
+
+
+def test_get_effective_space_reads_legacy_hnsw_configuration_before_metadata_regression_finding_7():
+    """Finding 7 regression: eval_v2 get_effective_space reads legacy hnsw_configuration.space before metadata."""
+    from migrate_v2.eval_v2 import get_effective_space
+
+    # Dict with legacy hnsw_configuration takes priority over metadata
+    col_config = {"hnsw_configuration": {"space": "ip"}}
+    col_meta = {"hnsw:space": "l2"}
+    assert get_effective_space(col_config, col_meta) == "ip"
+
+    # Object with legacy hnsw_configuration
+    class LegacyConfig:
+        hnsw_configuration = {"space": "cosine"}
+    assert get_effective_space(LegacyConfig(), col_meta) == "cosine"
+
+    # Fallback to metadata when config has no space
+    assert get_effective_space({}, col_meta) == "l2"
+

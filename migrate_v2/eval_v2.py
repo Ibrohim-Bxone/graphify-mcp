@@ -77,8 +77,32 @@ def get_effective_space(col_config: dict | None, col_meta: dict | None) -> str:
         hnsw_cfg = col_config.get("hnsw")
         if isinstance(hnsw_cfg, dict):
             space = hnsw_cfg.get("space")
-        elif "space" in col_config and isinstance(col_config.get("space"), str):
+        elif hasattr(hnsw_cfg, "space"):
+            space = getattr(hnsw_cfg, "space")
+
+        if not space:
+            hnsw_legacy = col_config.get("hnsw_configuration")
+            if isinstance(hnsw_legacy, dict):
+                space = hnsw_legacy.get("space")
+            elif hasattr(hnsw_legacy, "space"):
+                space = getattr(hnsw_legacy, "space")
+
+        if not space and "space" in col_config and isinstance(col_config.get("space"), str):
             space = col_config.get("space")
+    elif col_config is not None:
+        hnsw_cfg = getattr(col_config, "hnsw", None)
+        if isinstance(hnsw_cfg, dict):
+            space = hnsw_cfg.get("space")
+        elif hasattr(hnsw_cfg, "space"):
+            space = getattr(hnsw_cfg, "space")
+
+        if not space:
+            hnsw_legacy = getattr(col_config, "hnsw_configuration", None)
+            if isinstance(hnsw_legacy, dict):
+                space = hnsw_legacy.get("space")
+            elif hasattr(hnsw_legacy, "space"):
+                space = getattr(hnsw_legacy, "space")
+
     if not space and isinstance(col_meta, dict):
         space = col_meta.get("hnsw:space")
         if not space and "hnsw" in col_meta and isinstance(col_meta["hnsw"], dict):

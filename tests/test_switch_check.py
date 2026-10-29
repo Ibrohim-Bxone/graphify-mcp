@@ -62,6 +62,8 @@ def test_check_v2_identity_requires_db_and_detects_conflict_with_manifest(tmp_pa
         "model": "bge-m3",
         "model_digest": "sha256:manifest_digest_abc",
         "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
     }
     (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
 
@@ -77,6 +79,8 @@ def test_check_v2_identity_requires_db_and_detects_conflict_with_manifest(tmp_pa
         "model": "bge-m3",
         "model_digest": "sha256:contradictory_db_digest_xyz",
         "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
     }
     _create_mock_v2_sqlite(v2_dir, metadata=conflicting_meta)
 
@@ -155,6 +159,8 @@ def test_check_v2_identity_fails_when_graphify_collection_missing(tmp_path):
         "model": "bge-m3",
         "model_digest": "sha256:manifest_digest_abc",
         "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
     }
     (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
     # Create SQLite with 'other_col' instead of 'graphify'
@@ -175,6 +181,8 @@ def test_check_v2_identity_fails_when_collection_missing_mandatory_identity_fiel
         "model": "bge-m3",
         "model_digest": "sha256:manifest_digest_abc",
         "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
     }
     (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
 
@@ -189,6 +197,7 @@ def test_check_v2_identity_fails_when_collection_missing_mandatory_identity_fiel
 
 def test_find_running_graphify_processes_returns_pid_and_executable_only(monkeypatch):
     """Finding 9 regression: find_running_graphify_processes returns only pid and executable, never commandline or tokens."""
+    monkeypatch.setattr(sys, "platform", "win32")
     import subprocess
     fake_ps_json = json.dumps([
         {
@@ -219,4 +228,125 @@ def test_find_running_graphify_processes_returns_pid_and_executable_only(monkeyp
             assert set(p.keys()) == {"pid", "executable"}
             assert "token" not in str(p).lower()
             assert "commandline" not in p
+
+
+def test_check_v2_identity_and_conflict_check_compares_schema_version_distance_normalization_regression_finding_8(tmp_path):
+    """Finding 8 regression: _check_identity_conflict and check_v2_identity compare schema_version, distance, and normalization and FAIL on missing/conflicting values."""
+    from db import _check_identity_conflict
+    from embedders import ModelIdentityError
+    from migrate_v2.switch_check import check_v2_identity
+
+    # 1. _check_identity_conflict detects conflict in distance
+    id_a = {"model": "bge-m3", "model_digest": "sha256:abc", "dimension": 1024, "backend": "ollama", "schema_version": 2, "distance": "cosine", "normalization": False}
+    id_b = {"model": "bge-m3", "model_digest": "sha256:abc", "dimension": 1024, "backend": "ollama", "schema_version": 2, "distance": "l2", "normalization": False}
+    with pytest.raises(ModelIdentityError, match="distance"):
+        _check_identity_conflict(id_a, "manifest", id_b, "kolleksiya")
+
+    # 2. _check_identity_conflict detects conflict in normalization
+    id_c = {"model": "bge-m3", "model_digest": "sha256:abc", "dimension": 1024, "backend": "ollama", "schema_version": 2, "distance": "cosine", "normalization": True}
+    with pytest.raises(ModelIdentityError, match="normalization"):
+        _check_identity_conflict(id_a, "manifest", id_c, "kolleksiya")
+
+    # 3. _check_identity_conflict detects conflict in schema_version
+    id_d = {"model": "bge-m3", "model_digest": "sha256:abc", "dimension": 1024, "backend": "ollama", "schema_version": 1, "distance": "cosine", "normalization": False}
+    with pytest.raises(ModelIdentityError, match="schema_version"):
+        _check_identity_conflict(id_a, "manifest", id_d, "kolleksiya")
+
+    # 4. check_v2_identity FAILs on missing distance in collection
+    v2_dir = tmp_path / "v2_missing_dist"
+    v2_dir.mkdir()
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(id_a), encoding="utf-8")
+    meta_no_dist = dict(id_a)
+    del meta_no_dist["distance"]
+    _create_mock_v2_sqlite(v2_dir, metadata=meta_no_dist)
+    res = check_v2_identity(v2_dir)
+    assert res["status"] == "FAIL"
+    assert "distance" in res["error"]
+
+    # 5. check_v2_identity FAILs on conflicting normalization
+    v2_dir2 = tmp_path / "v2_conflicting_norm"
+    v2_dir2.mkdir()
+    (v2_dir2 / "graphify_manifest.json").write_text(json.dumps(id_a), encoding="utf-8")
+    meta_diff_norm = dict(id_a)
+    meta_diff_norm["normalization"] = True
+    _create_mock_v2_sqlite(v2_dir2, metadata=meta_diff_norm)
+    res2 = check_v2_identity(v2_dir2)
+    assert res2["status"] == "FAIL"
+    assert "normalization" in res2["error"]
+
+    # 6. TOPILMA 2: garbage normalization rejected in _check_identity_conflict and check_v2_identity
+    id_garbage = dict(id_a)
+    id_garbage["normalization"] = "garbage"
+    with pytest.raises(ModelIdentityError, match="normalization"):
+        _check_identity_conflict(id_a, "manifest", id_garbage, "kolleksiya")
+
+    v2_dir_garbage = tmp_path / "v2_garbage_norm"
+    v2_dir_garbage.mkdir()
+    (v2_dir_garbage / "graphify_manifest.json").write_text(json.dumps(id_garbage), encoding="utf-8")
+    _create_mock_v2_sqlite(v2_dir_garbage, metadata=id_a)
+    res_garbage = check_v2_identity(v2_dir_garbage)
+    assert res_garbage["status"] == "FAIL"
+    assert "normalization" in res_garbage["error"]
+
+
+def test_check_v2_identity_catches_malformed_dimension_within_fail_boundary_regression_finding_9(tmp_path):
+    """Finding 9 regression: malformed dimension value in manifest or collection returns FAIL instead of raising unhandled ValueError/OverflowError."""
+    from migrate_v2.switch_check import check_v2_identity
+
+    valid_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:abc",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+
+    # Manifest with malformed dimension "not_a_number"
+    v2_dir = tmp_path / "v2_bad_dim_manifest"
+    v2_dir.mkdir()
+    bad_manifest = dict(valid_id)
+    bad_manifest["dimension"] = "not_a_number"
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(bad_manifest), encoding="utf-8")
+    _create_mock_v2_sqlite(v2_dir, metadata=valid_id)
+
+    res = check_v2_identity(v2_dir)
+    assert res["status"] == "FAIL"
+    assert "dimension" in res["error"]
+
+    # Collection with malformed dimension
+    v2_dir2 = tmp_path / "v2_bad_dim_col"
+    v2_dir2.mkdir()
+    (v2_dir2 / "graphify_manifest.json").write_text(json.dumps(valid_id), encoding="utf-8")
+    bad_col = dict(valid_id)
+    bad_col["dimension"] = "invalid_int"
+    _create_mock_v2_sqlite(v2_dir2, metadata=bad_col)
+
+    res2 = check_v2_identity(v2_dir2)
+    assert res2["status"] == "FAIL"
+    assert "dimension" in res2["error"]
+
+    # TOPILMA 3: dimension=1e309 raises OverflowError inside int() and must return FAIL within boundary
+    v2_dir_inf = tmp_path / "v2_overflow_dim_manifest"
+    v2_dir_inf.mkdir()
+    overflow_manifest = dict(valid_id)
+    overflow_manifest["dimension"] = 1e309
+    (v2_dir_inf / "graphify_manifest.json").write_text(json.dumps(overflow_manifest), encoding="utf-8")
+    _create_mock_v2_sqlite(v2_dir_inf, metadata=valid_id)
+
+    res_inf = check_v2_identity(v2_dir_inf)
+    assert res_inf["status"] == "FAIL"
+    assert "dimension" in res_inf["error"]
+
+    v2_dir_inf_col = tmp_path / "v2_overflow_dim_col"
+    v2_dir_inf_col.mkdir()
+    (v2_dir_inf_col / "graphify_manifest.json").write_text(json.dumps(valid_id), encoding="utf-8")
+    overflow_col = dict(valid_id)
+    overflow_col["dimension"] = 1e309
+    _create_mock_v2_sqlite(v2_dir_inf_col, metadata=overflow_col)
+
+    res_inf_col = check_v2_identity(v2_dir_inf_col)
+    assert res_inf_col["status"] == "FAIL"
+    assert "dimension" in res_inf_col["error"]
 

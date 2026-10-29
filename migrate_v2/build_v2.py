@@ -206,13 +206,14 @@ def validate_destination_persisted_identity(
     expected_digest: str,
     expected_dimension: int,
     client=None,
+    expected_backend: str = "ollama",
 ) -> None:
     """Validate that any persisted manifest and collection identity in out_dir matches expected model identity.
 
     Fails closed if:
     - manifest exists but is unreadable or malformed JSON
-    - manifest identity mismatches expected model, digest, or dimension
-    - collection exists and has identity metadata that mismatches expected model, digest, or dimension
+    - manifest identity mismatches expected model, digest, dimension, or backend
+    - collection exists and has identity metadata that mismatches expected model, digest, dimension, or backend
     - manifest and collection metadata conflict with each other
     """
     manifest_meta = {}
@@ -227,6 +228,7 @@ def validate_destination_persisted_identity(
         if not isinstance(manifest_meta, dict):
             raise ModelIdentityError("Sync rad etildi: Destination manifest fayli yaroqsiz (JSON lug'at emas)")
 
+        m_backend = manifest_meta.get("backend")
         m_model = manifest_meta.get("model")
         m_digest = manifest_meta.get("model_digest")
         m_dim = manifest_meta.get("dimension")
@@ -239,9 +241,17 @@ def validate_destination_persisted_identity(
             raise ModelIdentityError(
                 f"Sync rad etildi: Destination manifest model_digest mos kelmadi: mavjud={m_digest}, kutilgan={expected_digest}"
             )
-        if m_dim is None or int(m_dim) != expected_dimension:
+        try:
+            m_dim_int = int(m_dim) if m_dim is not None else None
+        except (ValueError, TypeError, OverflowError):
+            m_dim_int = None
+        if m_dim_int != expected_dimension:
             raise ModelIdentityError(
                 f"Sync rad etildi: Destination manifest dimension mos kelmadi: mavjud={m_dim}, kutilgan={expected_dimension}"
+            )
+        if not m_backend or m_backend != expected_backend:
+            raise ModelIdentityError(
+                f"Sync rad etildi: Destination manifest backend mos kelmadi yoki yo'q: mavjud={m_backend}, kutilgan={expected_backend}"
             )
 
     col_meta = {}
@@ -252,45 +262,62 @@ def validate_destination_persisted_identity(
             if col:
                 if isinstance(getattr(col, "metadata", None), dict):
                     col_meta = col.metadata
-                try:
-                    cnt = col.count()
-                    col_count = int(cnt) if isinstance(cnt, (int, float)) else 0
-                except Exception:
-                    col_count = 0
+                cnt = col.count()
+                col_count = int(cnt) if isinstance(cnt, (int, float)) else 0
         except Exception as e:
             from db import _is_absent_collection_error
             if not _is_absent_collection_error(e):
                 raise
 
-    if not col_meta:
+    if not col_meta and client is None:
         sqlite_file = out_dir / "chroma.sqlite3"
         if sqlite_file.exists():
             try:
                 conn = sqlite3.connect(f"file:{sqlite_file.as_posix()}?mode=ro", uri=True, timeout=5.0)
                 try:
                     cur = conn.cursor()
-                    cur.execute("""
-                        SELECT m.key, m.str_value, m.int_value, m.float_value, m.bool_value
-                        FROM collection_metadata m
-                        JOIN collections c ON m.collection_id = c.id
-                        WHERE c.name = ?
-                    """, (col_name,))
-                    rows = cur.fetchall()
-                    if rows:
-                        s_meta = {}
-                        for k, s, i, f, b in rows:
-                            val = bool(b) if b is not None else i if i is not None else f if f is not None else s
-                            s_meta[k] = val
-                        col_meta = s_meta
+                    try:
+                        cur.execute("SELECT id FROM collections WHERE name = ?", (col_name,))
+                        c_row = cur.fetchone()
+                    except sqlite3.OperationalError as e:
+                        if "no such table" in str(e).lower():
+                            c_row = None
+                        else:
+                            raise
+
+                    if c_row is not None:
+                        col_id = c_row[0]
+                        cur.execute("""
+                            SELECT m.key, m.str_value, m.int_value, m.float_value, m.bool_value
+                            FROM collection_metadata m
+                            WHERE m.collection_id = ?
+                        """, (col_id,))
+                        rows = cur.fetchall()
+                        if rows:
+                            s_meta = {}
+                            for k, s, i, f, b in rows:
+                                val = bool(b) if b is not None else i if i is not None else f if f is not None else s
+                                s_meta[k] = val
+                            col_meta = s_meta
+
+                        cur.execute("""
+                            SELECT count(*)
+                            FROM embeddings e
+                            JOIN segments s ON e.segment_id = s.id
+                            WHERE s.collection = ?
+                        """, (col_id,))
+                        cnt_row = cur.fetchone()
+                        if cnt_row:
+                            col_count = cnt_row[0]
                 finally:
                     conn.close()
-            except sqlite3.OperationalError as e:
-                if "no such table" not in str(e).lower():
-                    raise
+            except sqlite3.OperationalError:
+                raise
             except Exception:
                 raise
 
     if isinstance(col_count, (int, float)) and col_count > 0:
+        c_backend = col_meta.get("backend") or col_meta.get("graphify:backend")
         c_model = col_meta.get("model") or col_meta.get("graphify:model")
         c_digest = col_meta.get("model_digest") or col_meta.get("graphify:model_digest")
         c_dim = col_meta.get("dimension") or col_meta.get("graphify:dimension")
@@ -303,11 +330,20 @@ def validate_destination_persisted_identity(
             raise ModelIdentityError(
                 f"Sync rad etildi: Destination kolleksiyada yozuvlar mavjud, ammo model_digest mos kelmadi yoki yo'q: mavjud={c_digest}, kutilgan={expected_digest}"
             )
-        if c_dim is None or int(c_dim) != expected_dimension:
+        try:
+            c_dim_int = int(c_dim) if c_dim is not None else None
+        except (ValueError, TypeError, OverflowError):
+            c_dim_int = None
+        if c_dim_int != expected_dimension:
             raise ModelIdentityError(
                 f"Sync rad etildi: Destination kolleksiyada yozuvlar mavjud, ammo dimension mos kelmadi yoki yo'q: mavjud={c_dim}, kutilgan={expected_dimension}"
             )
+        if not c_backend or c_backend != expected_backend:
+            raise ModelIdentityError(
+                f"Sync rad etildi: Destination kolleksiyada yozuvlar mavjud, ammo backend mos kelmadi yoki yo'q: mavjud={c_backend}, kutilgan={expected_backend}"
+            )
     elif col_meta:
+        c_backend = col_meta.get("backend") or col_meta.get("graphify:backend")
         c_model = col_meta.get("model") or col_meta.get("graphify:model")
         c_digest = col_meta.get("model_digest") or col_meta.get("graphify:model_digest")
         c_dim = col_meta.get("dimension") or col_meta.get("graphify:dimension")
@@ -320,9 +356,31 @@ def validate_destination_persisted_identity(
             raise ModelIdentityError(
                 f"Sync rad etildi: Destination kolleksiya model_digest mos kelmadi: mavjud={c_digest}, kutilgan={expected_digest}"
             )
-        if c_dim is not None and int(c_dim) != expected_dimension:
+        try:
+            c_dim_int = int(c_dim) if c_dim is not None else None
+        except (ValueError, TypeError, OverflowError):
+            c_dim_int = None
+        if c_dim is not None and c_dim_int != expected_dimension:
             raise ModelIdentityError(
                 f"Sync rad etildi: Destination kolleksiya dimension mos kelmadi: mavjud={c_dim}, kutilgan={expected_dimension}"
+            )
+
+        has_identity = bool(
+            c_model
+            or c_digest
+            or c_dim is not None
+            or c_backend
+            or col_meta.get("schema_version") is not None
+            or col_meta.get("graphify:schema_version") is not None
+        )
+        if has_identity:
+            if not c_backend or c_backend != expected_backend:
+                raise ModelIdentityError(
+                    f"Sync rad etildi: Destination kolleksiya backend mos kelmadi yoki yo'q: mavjud={c_backend}, kutilgan={expected_backend}"
+                )
+        if c_backend and c_backend != expected_backend:
+            raise ModelIdentityError(
+                f"Sync rad etildi: Destination kolleksiya backend mos kelmadi: mavjud={c_backend}, kutilgan={expected_backend}"
             )
 
     if manifest_meta and col_meta:
@@ -531,17 +589,32 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         BGE_M3_CONFIG["config"]["ollama"]["model"],
     )
 
-    import chromadb
-
-    client = chromadb.PersistentClient(path=str(out_dir))
+    # Strictly validate model identity before ANY mutation (read-only SQLite mode=ro first)
     validate_destination_persisted_identity(
         out_dir=out_dir,
         col_name=col_name,
         expected_model="bge-m3",
         expected_digest=model_digest,
         expected_dimension=EXPECTED_DIMENSION,
-        client=client,
+        client=None,
     )
+
+    # Invalidate completion status before the first destination mutation (Finding 3 & TOPILMA 5)
+    complete_file = out_dir / "build_complete.json"
+    had_complete_marker = complete_file.exists()
+    complete_data_backup = None
+    if had_complete_marker:
+        try:
+            with open(complete_file, "r", encoding="utf-8") as f:
+                complete_data_backup = json.load(f)
+        except Exception:
+            complete_data_backup = None
+
+    remove_completion_marker(out_dir)
+
+    import chromadb
+
+    client = chromadb.PersistentClient(path=str(out_dir))
 
     space = col_meta.get("hnsw:space", "l2")
     sync_identity = {
@@ -559,7 +632,14 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         embedding_function=embed_fn,
     )
     # Persist identity metadata before any upsert (Finding 1 & TOPILMA 2)
-    col.modify(metadata={**{k: v for k, v in (col.metadata if isinstance(col.metadata, dict) else {}).items() if not k.startswith("hnsw:")}, **sync_identity})
+    sync_modify_meta = {
+        k: v for k, v in {
+            **(col.metadata if isinstance(col.metadata, dict) else {}),
+            **sync_identity,
+        }.items()
+        if not k.startswith("hnsw:")
+    }
+    col.modify(metadata=sync_modify_meta)
 
     # Fetch destination records to compare hashes
     dest_data = col.get(include=["documents", "metadatas"])
@@ -591,16 +671,14 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
     )
 
     manifest_file = out_dir / "graphify_manifest.json"
-    complete_file = out_dir / "build_complete.json"
     kw_sqlite = out_dir / "keyword_index.sqlite3"
-    needs_rebuild = bool(to_upsert or to_delete or not complete_file.exists() or not kw_sqlite.exists() or not manifest_file.exists())
+    needs_rebuild = bool(to_upsert or to_delete or not had_complete_marker or not kw_sqlite.exists() or not manifest_file.exists())
 
     if not needs_rebuild:
         try:
             with open(manifest_file, "r", encoding="utf-8") as f:
                 m_check = json.load(f)
-            with open(complete_file, "r", encoding="utf-8") as f:
-                c_check = json.load(f)
+            c_check = complete_data_backup or {}
             kw_mtime_gen = str(int(kw_sqlite.stat().st_mtime))
             if (
                 m_check.get("corpus_hash") != corpus_hash
@@ -617,6 +695,13 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
     if not to_upsert and not to_delete and not needs_rebuild:
         try:
             verify_v2(col, v1_records, out_dir)
+            if complete_data_backup:
+                tmp_path = out_dir / "build_complete.json.tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(complete_data_backup, f, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, complete_file)
+            else:
+                write_build_complete_atomic(out_dir, sync_identity, started_at)
             print("[sync] Baza allaqachon to'liq sinxron holatda va tasdiqlangan.", flush=True)
             return
         except Exception:
@@ -667,8 +752,7 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
     )
 
     # Update collection metadata in ChromaDB (Finding 5)
-    # modify() replaces the whole metadata and rejects hnsw:* keys; the space stays in configuration_json
-    col.modify(metadata={**{k: v for k, v in (col.metadata if isinstance(col.metadata, dict) else {}).items() if not k.startswith("hnsw:")}, **identity})
+    col.modify(metadata={k: v for k, v in {**(col.metadata if isinstance(col.metadata, dict) else {}), **identity}.items() if not k.startswith("hnsw:")})
 
     # Write build_complete.json atomically
     write_build_complete_atomic(out_dir, identity, started_at)
@@ -722,27 +806,30 @@ def main():
 
     corpus_hash = compute_corpus_hash(records)
 
-    # 2. Setup v2 ChromaDB copying full collection metadata and configuration + identity
-    import chromadb
-
-    client = chromadb.PersistentClient(path=str(out_dir))
-    space = col_meta.get("hnsw:space", "l2")
-
     # Fetch model digest without falling back to unknown
     model_digest = get_ollama_model_digest(
         BGE_M3_CONFIG["config"]["ollama"]["base_url"],
         BGE_M3_CONFIG["config"]["ollama"]["model"],
     )
 
-    # Validate persisted collection AND manifest identity before any destination mutation
+    # Validate persisted collection AND manifest identity before any destination mutation (read-only SQLite first)
     validate_destination_persisted_identity(
         out_dir=out_dir,
         col_name=col_name,
         expected_model="bge-m3",
         expected_digest=model_digest,
         expected_dimension=EXPECTED_DIMENSION,
-        client=client,
+        client=None,
     )
+
+    # Remove completion marker before first mutation, keyword rebuild, or manifest update
+    remove_completion_marker(out_dir)
+
+    # 2. Setup v2 ChromaDB copying full collection metadata and configuration + identity
+    import chromadb
+
+    client = chromadb.PersistentClient(path=str(out_dir))
+    space = col_meta.get("hnsw:space", "l2")
 
     merged_metadata = dict(col_meta)
     merged_metadata.update({
@@ -765,7 +852,14 @@ def main():
         embedding_function=embed_fn,
     )
     # Persist identity metadata before any upsert (Finding 1 & TOPILMA 2)
-    col.modify(metadata={**{k: v for k, v in (col.metadata if isinstance(col.metadata, dict) else {}).items() if not k.startswith("hnsw:")}, **merged_metadata})
+    build_modify_meta = {
+        k: v for k, v in {
+            **(col.metadata if isinstance(col.metadata, dict) else {}),
+            **merged_metadata,
+        }.items()
+        if not k.startswith("hnsw:")
+    }
+    col.modify(metadata=build_modify_meta)
 
     # Resumable: compare destination document+metadata hashes, do not skip changed ids!
     dest_data = col.get(include=["documents", "metadatas"])
@@ -854,8 +948,7 @@ def main():
     )
 
     # Update collection metadata in ChromaDB (Finding 5)
-    # modify() replaces the whole metadata and rejects hnsw:* keys; the space stays in configuration_json
-    col.modify(metadata={**{k: v for k, v in (col.metadata if isinstance(col.metadata, dict) else {}).items() if not k.startswith("hnsw:")}, **identity})
+    col.modify(metadata={k: v for k, v in {**(col.metadata if isinstance(col.metadata, dict) else {}), **identity}.items() if not k.startswith("hnsw:")})
 
     # 7. Write build_complete.json atomically
     write_build_complete_atomic(out_dir, identity, started_at)

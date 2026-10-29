@@ -4,6 +4,7 @@ All tests use temporary directories, mock Ollama / network, and never touch live
 """
 
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -421,4 +422,32 @@ def test_build_identity_embedder_local_accepts_canonical_variants_and_rejects_ot
         }
         with pytest.raises(ModelIdentityError, match="Qo'llab-quvvatlanmagan lokal model"):
             build_identity_embedder(bad_id)
+
+
+def test_get_db_identity_raises_when_collections_table_has_graphify_but_metadata_table_missing_regression_finding_6(tmp_path):
+    """Finding 6 regression: only confirmed absent collection bypasses identity lookup; missing collection_metadata raises OperationalError when collection exists."""
+    db_file = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_file))
+    cur = conn.cursor()
+    # collections table exists and has graphify collection, but collection_metadata table is missing
+    cur.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);")
+    cur.execute("INSERT INTO collections VALUES ('col-1', 'graphify');")
+    conn.commit()
+    conn.close()
+
+    # Must NOT swallow into None! Must raise OperationalError because collection exists!
+    with pytest.raises(sqlite3.OperationalError, match="no such table: collection_metadata"):
+        db.get_db_identity(db_path=str(tmp_path))
+
+    # Conversely, if collections has no graphify collection, it is confirmed absent -> returns None
+    conn = sqlite3.connect(str(db_file))
+    cur = conn.cursor()
+    cur.execute("DELETE FROM collections WHERE name = 'graphify';")
+    cur.execute("INSERT INTO collections VALUES ('col-other', 'other_collection');")
+    conn.commit()
+    conn.close()
+
+    res = db.get_db_identity(db_path=str(tmp_path))
+    assert res is None
+
 

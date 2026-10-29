@@ -185,6 +185,9 @@ def check_v2_identity(v2_dir: Path) -> dict:
     c_model = col_meta.get("model") or col_meta.get("graphify:model")
     c_dim = col_meta.get("dimension") or col_meta.get("graphify:dimension")
     c_digest = col_meta.get("model_digest") or col_meta.get("graphify:model_digest")
+    c_schema = col_meta.get("schema_version") or col_meta.get("graphify:schema_version")
+    c_dist = col_meta.get("distance") or col_meta.get("graphify:distance")
+    c_norm = col_meta.get("normalization") if col_meta.get("normalization") is not None else col_meta.get("graphify:normalization")
 
     if not c_backend:
         return {"status": "FAIL", "error": "Baza kolleksiyasida 'backend' identifikatsiyasi topilmadi"}
@@ -194,20 +197,86 @@ def check_v2_identity(v2_dir: Path) -> dict:
         return {"status": "FAIL", "error": "Baza kolleksiyasida 'dimension' identifikatsiyasi topilmadi"}
     if str(c_backend).lower() == "ollama" and not c_digest:
         return {"status": "FAIL", "error": "Baza kolleksiyasida Ollama uchun 'model_digest' topilmadi"}
+    if c_schema is None:
+        return {"status": "FAIL", "error": "Baza kolleksiyasida 'schema_version' topilmadi"}
+    if not c_dist:
+        return {"status": "FAIL", "error": "Baza kolleksiyasida 'distance' topilmadi"}
+    if c_norm is None:
+        return {"status": "FAIL", "error": "Baza kolleksiyasida 'normalization' topilmadi"}
 
     m_backend = manifest_identity.get("backend")
     m_model = manifest_identity.get("model")
     m_dim = manifest_identity.get("dimension")
     m_digest = manifest_identity.get("model_digest")
+    m_schema = manifest_identity.get("schema_version")
+    m_dist = manifest_identity.get("distance")
+    m_norm = manifest_identity.get("normalization")
 
     if not m_backend or str(m_backend).lower() != str(c_backend).lower():
         return {"status": "FAIL", "error": f"Backend mos kelmadi: manifest={m_backend}, kolleksiya={c_backend}"}
     if not m_model or str(m_model) != str(c_model):
         return {"status": "FAIL", "error": f"Model nomi mos kelmadi: manifest={m_model}, kolleksiya={c_model}"}
-    if m_dim is None or int(m_dim) != int(c_dim):
+    if m_dim is None:
+        return {"status": "FAIL", "error": "Manifestda 'dimension' topilmadi"}
+
+    try:
+        m_dim_int = int(m_dim)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "FAIL", "error": f"Manifestda 'dimension' noto'g'ri formatda: {m_dim}"}
+
+    try:
+        c_dim_int = int(c_dim)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "FAIL", "error": f"Baza kolleksiyasida 'dimension' noto'g'ri formatda: {c_dim}"}
+
+    if m_dim_int != c_dim_int:
         return {"status": "FAIL", "error": f"Dimension mos kelmadi: manifest={m_dim}, kolleksiya={c_dim}"}
+
     if str(c_backend).lower() == "ollama" and str(m_digest) != str(c_digest):
         return {"status": "FAIL", "error": f"Model digest mos kelmadi: manifest={m_digest}, kolleksiya={c_digest}"}
+
+    if m_schema is None:
+        return {"status": "FAIL", "error": "Manifestda 'schema_version' topilmadi"}
+
+    try:
+        m_schema_int = int(m_schema)
+        c_schema_int = int(c_schema)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "FAIL", "error": f"schema_version noto'g'ri formatda: manifest={m_schema}, kolleksiya={c_schema}"}
+
+    if m_schema_int != c_schema_int:
+        return {"status": "FAIL", "error": f"schema_version mos kelmadi: manifest={m_schema}, kolleksiya={c_schema}"}
+
+    if not m_dist or str(m_dist).lower() != str(c_dist).lower():
+        return {"status": "FAIL", "error": f"distance mos kelmadi: manifest={m_dist}, kolleksiya={c_dist}"}
+
+    if m_norm is None:
+        return {"status": "FAIL", "error": "Manifestda 'normalization' topilmadi"}
+
+    def _parse_bool(val):
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, int) and val in (0, 1):
+            return bool(val)
+        s = str(val).strip().lower()
+        if s in ("true", "1"):
+            return True
+        if s in ("false", "0"):
+            return False
+        raise ValueError(f"Noto'g'ri boolean qiymat: {val}")
+
+    try:
+        norm_m = _parse_bool(m_norm)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "FAIL", "error": f"Manifestda 'normalization' noto'g'ri formatda: {m_norm}"}
+
+    try:
+        norm_c = _parse_bool(c_norm)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "FAIL", "error": f"Baza kolleksiyasida 'normalization' noto'g'ri formatda: {c_norm}"}
+
+    if norm_m != norm_c:
+        return {"status": "FAIL", "error": f"normalization mos kelmadi: manifest={m_norm}, kolleksiya={c_norm}"}
 
     try:
         _check_identity_conflict(manifest_identity, "manifest", col_meta, "kolleksiya")
