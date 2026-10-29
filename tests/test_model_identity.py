@@ -451,3 +451,147 @@ def test_get_db_identity_raises_when_collections_table_has_graphify_but_metadata
     assert res is None
 
 
+def test_identity_fields_validated_independently_dimension_float_fails(tmp_path):
+    """Regression test (Finding 3): validate every present identity field independently (dimension 1024.9 must fail)."""
+    # 1. Manifest with float dimension fails independently (even without collection or graphify prefix)
+    m_dir = tmp_path / "float_dim_manifest"
+    m_dir.mkdir()
+    manifest_data = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:abc",
+        "dimension": 1024.9,
+    }
+    (m_dir / "graphify_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    with pytest.raises(ModelIdentityError, match="dimension"):
+        db.get_db_identity(db_path=str(m_dir))
+
+    # 2. Prefixed graphify:dimension float fails independently
+    m_dir2 = tmp_path / "float_dim_prefixed"
+    m_dir2.mkdir()
+    manifest_data2 = {
+        "graphify:schema_version": 2,
+        "graphify:backend": "ollama",
+        "graphify:model": "bge-m3",
+        "graphify:model_digest": "sha256:abc",
+        "graphify:dimension": 1024.9,
+    }
+    (m_dir2 / "graphify_manifest.json").write_text(json.dumps(manifest_data2), encoding="utf-8")
+
+    with pytest.raises(ModelIdentityError, match="dimension"):
+        db.get_db_identity(db_path=str(m_dir2))
+
+    # 3. Collection metadata with float dimension fails independently
+    c_client = Mock()
+    c_col = Mock()
+    c_col.metadata = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:abc",
+        "dimension": 1024.9,
+    }
+    c_client.get_collection.return_value = c_col
+
+    with pytest.raises(ModelIdentityError, match="dimension"):
+        db.get_db_identity(client=c_client, db_path=str(tmp_path / "nonexistent"))
+
+
+def test_http_storage_mode_checks_plain_vs_prefixed_conflict_before_early_return(monkeypatch):
+    """Regression test (Finding 4): plain-vs-graphify: conflict check runs before HTTP early return in db.py."""
+    monkeypatch.setattr(db, "STORAGE_MODE", "http")
+
+    mock_client = Mock()
+    mock_col = Mock()
+    # Conflicting model names
+    mock_col.metadata = {
+        "schema_version": 2,
+        "model": "bge-m3",
+        "graphify:model": "all-MiniLM-L6-v2",
+        "model_digest": "sha256:abc",
+        "dimension": 1024,
+    }
+    mock_client.get_collection.return_value = mock_col
+
+    with pytest.raises(ModelIdentityError, match="Model identifikatsiyasi nomuvofiq"):
+        db.get_db_identity(client=mock_client)
+
+    # Conflicting dimension
+    mock_col.metadata = {
+        "schema_version": 2,
+        "model": "bge-m3",
+        "model_digest": "sha256:abc",
+        "dimension": 1024,
+        "graphify:dimension": 384,
+    }
+    with pytest.raises(ModelIdentityError, match="dimension"):
+        db.get_db_identity(client=mock_client)
+
+    # Invalid field in HTTP mode (dimension float)
+    mock_col.metadata = {
+        "schema_version": 2,
+        "model": "bge-m3",
+        "model_digest": "sha256:abc",
+        "dimension": 1024.9,
+    }
+    with pytest.raises(ModelIdentityError, match="dimension"):
+        db.get_db_identity(client=mock_client)
+
+
+def test_http_storage_mode_validates_raw_c_meta_independently_before_early_returns(monkeypatch):
+    """Regression test: HTTP storage mode validates raw c_meta fields independently before early returns."""
+    monkeypatch.setattr(db, "STORAGE_MODE", "http")
+
+    mock_client = Mock()
+    mock_col = Mock()
+    mock_client.get_collection.return_value = mock_col
+
+    # 1. schema_version as float 2.9 must raise ModelIdentityError, not return None
+    mock_col.metadata = {"schema_version": 2.9}
+    with pytest.raises(ModelIdentityError, match="schema_version"):
+        db.get_db_identity(client=mock_client)
+
+    # 2. normalization as 'invalid' must raise ModelIdentityError, not return None
+    mock_col.metadata = {"normalization": "invalid"}
+    with pytest.raises(ModelIdentityError, match="normalization"):
+        db.get_db_identity(client=mock_client)
+
+    # 3. graphify:normalization as 'invalid' must raise ModelIdentityError, not return None
+    mock_col.metadata = {"graphify:normalization": "invalid"}
+    with pytest.raises(ModelIdentityError, match="normalization"):
+        db.get_db_identity(client=mock_client)
+
+
+def test_local_sources_validate_raw_metadata_independently(tmp_path):
+    """Regression test: Local manifest and collection metadata validate raw fields independently."""
+    # 1. Manifest with normalization 'invalid' raises ModelIdentityError
+    m_dir = tmp_path / "bad_norm_manifest"
+    m_dir.mkdir()
+    (m_dir / "graphify_manifest.json").write_text(json.dumps({"normalization": "invalid"}), encoding="utf-8")
+    with pytest.raises(ModelIdentityError, match="normalization"):
+        db.get_db_identity(db_path=str(m_dir))
+
+    # 2. Manifest with schema_version 2.9 raises ModelIdentityError
+    s_dir = tmp_path / "bad_schema_manifest"
+    s_dir.mkdir()
+    (s_dir / "graphify_manifest.json").write_text(json.dumps({"schema_version": 2.9}), encoding="utf-8")
+    with pytest.raises(ModelIdentityError, match="schema_version"):
+        db.get_db_identity(db_path=str(s_dir))
+
+    # 3. Local client collection with normalization 'invalid' raises ModelIdentityError
+    c_client = Mock()
+    c_col = Mock()
+    c_col.metadata = {"normalization": "invalid"}
+    c_client.get_collection.return_value = c_col
+    with pytest.raises(ModelIdentityError, match="normalization"):
+        db.get_db_identity(client=c_client, db_path=str(tmp_path / "nonexistent"))
+
+    # 4. Local client collection with schema_version 2.9 raises ModelIdentityError
+    c_col.metadata = {"schema_version": 2.9}
+    with pytest.raises(ModelIdentityError, match="schema_version"):
+        db.get_db_identity(client=c_client, db_path=str(tmp_path / "nonexistent"))
+
+
+

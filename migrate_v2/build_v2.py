@@ -221,7 +221,7 @@ def validate_destination_persisted_identity(
     - plain and prefixed graphify:* keys conflict within the same source
     - collection count is bool, non-int, or negative
     """
-    from db import _parse_int, _parse_bool
+    from identity_utils import _parse_int, _parse_bool, _check_source_internal_conflict
 
     keys_to_extract = [
         ("backend", str),
@@ -244,6 +244,8 @@ def validate_destination_persisted_identity(
 
         if not isinstance(manifest_meta, dict):
             raise ModelIdentityError("Sync rad etildi: Destination manifest fayli yaroqsiz (JSON lug'at emas)")
+
+        _check_source_internal_conflict(manifest_meta, "Destination manifest")
 
         resolved_m = {}
         for key, cast_type in keys_to_extract:
@@ -336,7 +338,7 @@ def validate_destination_persisted_identity(
         except ModelIdentityError:
             raise
         except Exception as e:
-            from db import _is_absent_collection_error
+            from identity_utils import _is_absent_collection_error
             if not _is_absent_collection_error(e):
                 raise
 
@@ -394,6 +396,7 @@ def validate_destination_persisted_identity(
 
     resolved_c = {}
     if col_meta:
+        _check_source_internal_conflict(col_meta, "Destination kolleksiya")
         for key, cast_type in keys_to_extract:
             val_plain = col_meta.get(key)
             val_pref = col_meta.get(f"graphify:{key}")
@@ -528,7 +531,7 @@ def validate_destination_persisted_identity(
                 )
 
     if manifest_meta and col_meta:
-        from db import _check_identity_conflict
+        from identity_utils import _check_identity_conflict
         _check_identity_conflict(manifest_meta, "manifest", col_meta, "kolleksiya")
 
 
@@ -716,7 +719,13 @@ def _validate_completion_marker_identity(marker_data: dict, current_identity: di
     """Validate completion marker identity fields against current build. Return True if valid, False if mismatch or missing."""
     if not isinstance(marker_data, dict):
         return False
-    from db import _parse_int, _parse_bool
+    from identity_utils import _parse_int, _parse_bool, _check_source_internal_conflict, _check_identity_conflict
+    from embedders import ModelIdentityError
+    try:
+        _check_source_internal_conflict(marker_data, "completion_marker")
+        _check_identity_conflict(marker_data, "completion_marker", current_identity, "current_identity")
+    except ModelIdentityError:
+        return False
     keys = ["model", "model_digest", "dimension", "backend", "distance", "normalization", "schema_version"]
     for k in keys:
         if k not in marker_data or marker_data[k] is None:

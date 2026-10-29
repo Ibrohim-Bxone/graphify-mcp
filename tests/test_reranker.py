@@ -749,3 +749,119 @@ def test_disable_fallback_failure_falls_back_to_cpu(tmp_path):
                         assert inst.fallback_reason is not None
                         assert "disable fallback" in inst.fallback_reason
                         assert "model_int8.onnx" in inst.model_path
+
+
+def test_cpu_session_constructor_guards_stdout(tmp_path, monkeypatch, capsys):
+    """Regression test (Finding 2): CPU ORT session constructor redirects stdout to stderr."""
+    int8_file, fp16_file, tok_json, tok_cfg = _setup_dummy_model_files(tmp_path)
+    monkeypatch.setenv("GRAPHIFY_RERANK_DEVICE", "cpu")
+
+    mock_cpu_session = Mock()
+    mock_cpu_session.get_providers.return_value = ["CPUExecutionProvider"]
+    mock_tok = Mock()
+
+    def noisy_session_factory(*args, **kwargs):
+        print("ORT CPU initialization notice on stdout")
+        return mock_cpu_session
+
+    def mock_hf_cache(repo_id, filename, revision):
+        if filename == "onnx/model_int8.onnx":
+            return str(int8_file)
+        if filename == "tokenizer.json":
+            return str(tok_json)
+        if filename == "tokenizer_config.json":
+            return str(tok_cfg)
+        return None
+
+    import onnxruntime
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
+        with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
+            with patch("onnxruntime.InferenceSession", side_effect=noisy_session_factory):
+                inst, err = get_reranker_with_reason()
+                assert err is None
+                assert inst is not None
+                captured = capsys.readouterr()
+                assert "ORT CPU initialization notice on stdout" not in captured.out, "CPU ORT session constructor must not write to stdout!"
+                assert "ORT CPU initialization notice on stdout" in captured.err, "CPU ORT session constructor output must be redirected to stderr!"
+
+
+def test_cpu_session_disables_fallback_and_guards_stdout_on_runtime_error(tmp_path, monkeypatch, capsys):
+    """Regression test: CPU ORT session disables fallback and guards stdout during runtime errors."""
+    int8_file, fp16_file, tok_json, tok_cfg = _setup_dummy_model_files(tmp_path)
+    monkeypatch.setenv("GRAPHIFY_RERANK_DEVICE", "cpu")
+
+    mock_cpu_session = Mock()
+    mock_cpu_session.get_providers.return_value = ["CPUExecutionProvider"]
+
+    class DummyEnc:
+        def __init__(self):
+            self.ids = [1, 2]
+            self.attention_mask = [1, 1]
+
+    mock_tok = Mock()
+    mock_tok.encode_batch.side_effect = lambda batch: [DummyEnc() for _ in batch]
+
+    def noisy_runtime_fail(*args, **kwargs):
+        print("ORT CPU runtime EPFail fallback notice on stdout")
+        raise RuntimeError("EPFail: execution provider failed")
+
+    mock_cpu_session.run.side_effect = noisy_runtime_fail
+
+    def mock_hf_cache(repo_id, filename, revision):
+        if filename == "onnx/model_int8.onnx":
+            return str(int8_file)
+        if filename == "tokenizer.json":
+            return str(tok_json)
+        if filename == "tokenizer_config.json":
+            return str(tok_cfg)
+        return None
+
+    import onnxruntime
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
+        with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
+            with patch("onnxruntime.InferenceSession", return_value=mock_cpu_session):
+                inst, err = get_reranker_with_reason()
+                assert err is None
+                assert inst is not None
+                assert inst.device == "cpu"
+                mock_cpu_session.disable_fallback.assert_called_once()
+
+                capsys.readouterr()
+
+                scores, score_err = inst.score_pairs([("query", "document")])
+                assert scores is None
+                assert score_err is not None
+                assert "epfail" in score_err.lower() or "runtime" in score_err.lower() or "cuda" in score_err.lower()
+
+                captured = capsys.readouterr()
+                assert "ORT CPU runtime EPFail fallback notice on stdout" not in captured.out, "CPU ORT runtime error must not write to stdout!"
+                assert "ORT CPU runtime EPFail fallback notice on stdout" in captured.err, "CPU ORT runtime error output must be redirected to stderr!"
+
+
+def test_cpu_session_disable_fallback_failure_fails_cleanly(tmp_path, monkeypatch):
+    """Regression test: CPU ORT session returns clean error when disable_fallback fails."""
+    int8_file, fp16_file, tok_json, tok_cfg = _setup_dummy_model_files(tmp_path)
+    monkeypatch.setenv("GRAPHIFY_RERANK_DEVICE", "cpu")
+
+    mock_cpu_session = Mock()
+    mock_cpu_session.get_providers.return_value = ["CPUExecutionProvider"]
+    mock_cpu_session.disable_fallback.side_effect = RuntimeError("disable_fallback failed on CPU")
+    mock_tok = Mock()
+
+    def mock_hf_cache(repo_id, filename, revision):
+        if filename == "onnx/model_int8.onnx":
+            return str(int8_file)
+        if filename == "tokenizer.json":
+            return str(tok_json)
+        if filename == "tokenizer_config.json":
+            return str(tok_cfg)
+        return None
+
+    import onnxruntime
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
+        with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
+            with patch("onnxruntime.InferenceSession", return_value=mock_cpu_session):
+                inst, err = get_reranker_with_reason()
+                assert inst is None
+                assert "failed to disable fallback" in err
+

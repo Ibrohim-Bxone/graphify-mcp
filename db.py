@@ -64,94 +64,16 @@ def get_db_mtime() -> float:
     return max(mtimes) if mtimes else 0.0
 
 
-def _parse_bool(val):
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, int) and val in (0, 1):
-        return bool(val)
-    s = str(val).strip().lower()
-    if s in ("true", "1"):
-        return True
-    if s in ("false", "0"):
-        return False
-    raise ValueError(f"Noto'g'ri boolean qiymat: {val}")
+from identity_utils import (
+    ModelIdentityError,
+    _parse_bool,
+    _parse_int,
+    _check_identity_conflict,
+    _check_source_internal_conflict,
+    _is_absent_collection_error,
+    _has_identity_meta,
+)
 
-
-def _parse_int(val):
-    if isinstance(val, bool):
-        raise ValueError(f"Noto'g'ri integer qiymat (bool): {val!r}")
-    if isinstance(val, float):
-        if not val.is_integer():
-            raise ValueError(f"Noto'g'ri integer qiymat (kasr son): {val!r}")
-        return int(val)
-    if isinstance(val, int):
-        return val
-    if isinstance(val, str):
-        s = val.strip()
-        try:
-            return int(s)
-        except ValueError:
-            try:
-                f = float(s)
-                if f.is_integer():
-                    return int(f)
-            except (ValueError, OverflowError):
-                pass
-            raise ValueError(f"Noto'g'ri integer qiymat: {val!r}")
-    raise ValueError(f"Noto'g'ri integer qiymat: {val!r}")
-
-
-def _check_identity_conflict(source_a: dict, name_a: str, source_b: dict, name_b: str) -> None:
-    """Compares key identity fields between two sources and raises ModelIdentityError on mismatch."""
-    keys_to_compare = [
-        ("schema_version", _parse_int),
-        ("backend", str),
-        ("model", str),
-        ("model_digest", str),
-        ("dimension", _parse_int),
-        ("distance", str),
-        ("normalization", _parse_bool),
-    ]
-    for src, name in ((source_a, name_a), (source_b, name_b)):
-        if not isinstance(src, dict):
-            continue
-        for key, cast_type in keys_to_compare:
-            val_plain = src.get(key)
-            val_pref = src.get(f"graphify:{key}")
-            if val_plain is not None and val_pref is not None:
-                differ = False
-                try:
-                    c1 = cast_type(val_plain)
-                    c2 = cast_type(val_pref)
-                    differ = (c1 != c2)
-                except Exception:
-                    differ = True
-                if differ:
-                    from embedders import ModelIdentityError
-                    raise ModelIdentityError(
-                        f"Model identifikatsiyasi nomuvofiq ({name}): "
-                        f"'{key}' va 'graphify:{key}' qiymatlari mos kelmadi ({val_plain} != {val_pref})"
-                    )
-
-    for key, cast_type in keys_to_compare:
-        val_a = source_a.get(key) if source_a.get(key) is not None else source_a.get(f"graphify:{key}")
-        val_b = source_b.get(key) if source_b.get(key) is not None else source_b.get(f"graphify:{key}")
-        if val_a is not None and val_b is not None:
-            try:
-                c_a = cast_type(val_a)
-                c_b = cast_type(val_b)
-            except (ValueError, TypeError, OverflowError) as e:
-                from embedders import ModelIdentityError
-                raise ModelIdentityError(
-                    f"Model identifikatsiyasi nomuvofiq ({name_a} vs {name_b}): "
-                    f"{key} qiymatini o'qib bo'lmadi ({val_a} vs {val_b})"
-                ) from e
-            if c_a != c_b:
-                from embedders import ModelIdentityError
-                raise ModelIdentityError(
-                    f"Model identifikatsiyasi nomuvofiq ({name_a} vs {name_b}): "
-                    f"{key} ({val_a} != {val_b})"
-                )
 
 
 def _align_chroma_collection_configuration(db_path: Path, collection_name: str = COLLECTION) -> None:
@@ -186,27 +108,6 @@ def _align_chroma_collection_configuration(db_path: Path, collection_name: str =
         pass
 
 
-def _is_absent_collection_error(e: Exception) -> bool:
-    msg = str(e).lower()
-    if "tenant" in msg:
-        return False
-    try:
-        import chromadb.errors
-        if isinstance(e, chromadb.errors.NotFoundError):
-            return "collection" in msg and ("does not exist" in msg or "not found" in msg)
-        if hasattr(chromadb.errors, "InvalidCollectionException") and isinstance(e, chromadb.errors.InvalidCollectionException):
-            return True
-    except (ImportError, AttributeError):
-        pass
-    err_cls_name = type(e).__name__
-    if err_cls_name == "InvalidCollectionException":
-        return True
-    if err_cls_name == "NotFoundError":
-        return "collection" in msg and ("does not exist" in msg or "not found" in msg)
-    if isinstance(e, ValueError):
-        return "collection" in msg and ("does not exist" in msg or "not found" in msg)
-    return False
-
 
 def get_db_identity(client=None, db_path: str = None) -> dict | None:
     """Reads model identity metadata from collection metadata, SQLite, or graphify_manifest.json.
@@ -224,18 +125,13 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
                 col = client.get_collection(COLLECTION)
                 if col and isinstance(getattr(col, "metadata", None), dict):
                     c_meta = col.metadata
-                    if (
-                        c_meta.get("schema_version") == 2
-                        or c_meta.get("graphify:schema_version") == 2
-                        or "model_digest" in c_meta
-                        or "graphify:model_digest" in c_meta
-                        or "model" in c_meta
-                    ):
+                    _check_source_internal_conflict(c_meta, "kolleksiya")
+                    if _has_identity_meta(c_meta):
                         col_meta.update(c_meta)
             except Exception as e:
                 if not _is_absent_collection_error(e):
                     raise
-        if col_meta.get("schema_version") == 2 or col_meta.get("graphify:schema_version") == 2 or "model_digest" in col_meta or "graphify:model_digest" in col_meta or ("model" in col_meta and "dimension" in col_meta):
+        if col_meta:
             return col_meta
         return None
 
@@ -247,10 +143,13 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
         try:
             with open(manifest_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("schema_version") == 2 or "model_digest" in data or "backend" in data or "model" in data:
-                manifest_meta.update(data)
+            if isinstance(data, dict):
+                _check_source_internal_conflict(data, "manifest")
+                if _has_identity_meta(data):
+                    manifest_meta.update(data)
+        except ModelIdentityError:
+            raise
         except Exception as e:
-            from embedders import ModelIdentityError
             raise ModelIdentityError(f"graphify_manifest.json o'qishda xatolik: {e}") from e
 
     # 2. Check client existing collection
@@ -259,13 +158,8 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
             col = client.get_collection(COLLECTION)
             if col and isinstance(getattr(col, "metadata", None), dict):
                 c_meta = col.metadata
-                if (
-                    c_meta.get("schema_version") == 2
-                    or c_meta.get("graphify:schema_version") == 2
-                    or "model_digest" in c_meta
-                    or "graphify:model_digest" in c_meta
-                    or "model" in c_meta
-                ):
+                _check_source_internal_conflict(c_meta, "kolleksiya")
+                if _has_identity_meta(c_meta):
                     col_meta.update(c_meta)
         except Exception as e:
             if not _is_absent_collection_error(e):
@@ -300,13 +194,8 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
                             for k, s, i, f, b in rows:
                                 val = bool(b) if b is not None else i if i is not None else f if f is not None else s
                                 s_meta[k] = val
-                            if (
-                                s_meta.get("schema_version") == 2
-                                or s_meta.get("graphify:schema_version") == 2
-                                or "model_digest" in s_meta
-                                or "graphify:model_digest" in s_meta
-                                or "model" in s_meta
-                            ):
+                            _check_source_internal_conflict(s_meta, "kolleksiya")
+                            if _has_identity_meta(s_meta):
                                 col_meta.update(s_meta)
                 finally:
                     conn.close()
@@ -315,46 +204,8 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
             except Exception:
                 raise
 
-    has_manifest_id = (
-        manifest_meta.get("schema_version") == 2
-        or "model_digest" in manifest_meta
-        or ("model" in manifest_meta and "dimension" in manifest_meta)
-    )
-    has_col_id = (
-        col_meta.get("schema_version") == 2
-        or col_meta.get("graphify:schema_version") == 2
-        or "model_digest" in col_meta
-        or "graphify:model_digest" in col_meta
-        or ("model" in col_meta and "dimension" in col_meta)
-    )
-
-    for src, name in ((manifest_meta, "manifest"), (col_meta, "kolleksiya")):
-        if src:
-            for key, cast_type in (
-                ("schema_version", _parse_int),
-                ("backend", str),
-                ("model", str),
-                ("model_digest", str),
-                ("dimension", _parse_int),
-                ("distance", str),
-                ("normalization", _parse_bool),
-            ):
-                val_plain = src.get(key)
-                val_pref = src.get(f"graphify:{key}")
-                if val_plain is not None and val_pref is not None:
-                    differ = False
-                    try:
-                        c1 = cast_type(val_plain)
-                        c2 = cast_type(val_pref)
-                        differ = (c1 != c2)
-                    except Exception:
-                        differ = True
-                    if differ:
-                        from embedders import ModelIdentityError
-                        raise ModelIdentityError(
-                            f"Model identifikatsiyasi nomuvofiq ({name}): "
-                            f"'{key}' va 'graphify:{key}' qiymatlari mos kelmadi ({val_plain} != {val_pref})"
-                        )
+    has_manifest_id = _has_identity_meta(manifest_meta)
+    has_col_id = _has_identity_meta(col_meta)
 
     if has_manifest_id and has_col_id:
         _check_identity_conflict(manifest_meta, "manifest", col_meta, "kolleksiya")
@@ -365,7 +216,7 @@ def get_db_identity(client=None, db_path: str = None) -> dict | None:
     if col_meta:
         meta.update(col_meta)
 
-    if meta.get("schema_version") == 2 or meta.get("graphify:schema_version") == 2 or "model_digest" in meta or "graphify:model_digest" in meta or ("model" in meta and "dimension" in meta):
+    if _has_identity_meta(meta):
         return meta
     return None
 

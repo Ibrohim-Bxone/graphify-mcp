@@ -493,3 +493,25 @@ def test_dimension_and_schema_version_reject_bool_and_non_integer_floats_regress
             client=None,
         )
 
+
+def test_check_v2_identity_rejects_float_dimension_and_conflicting_prefixed_fields(tmp_path):
+    """Finding 3 & 4: check_v2_identity rejects float dimension and intra-source conflicting prefixed fields."""
+    v2_dir = tmp_path / "v2_bad_dim"
+    v2_dir.mkdir()
+    valid_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:abc",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(valid_id), encoding="utf-8")
+    _create_mock_v2_sqlite(v2_dir, metadata=dict(valid_id, dimension=1024.9))
+
+    res = check_v2_identity(v2_dir)
+    assert res["status"] == "FAIL"
+    assert "dimension" in res["error"]
+
+

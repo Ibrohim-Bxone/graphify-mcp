@@ -1209,3 +1209,168 @@ def test_unchanged_sync_rebuilds_when_completion_marker_identity_missing_or_mism
     assert "distance" in restored_marker and restored_marker["distance"] == "cosine"
     assert "normalization" in restored_marker and restored_marker["normalization"] is False
 
+
+def test_import_build_v2_does_not_open_db(tmp_path):
+    """Regression test (Finding 1): importing build_v2 and validating destination does not import db or open any database."""
+    import sys
+    from unittest.mock import patch, Mock
+
+    def db_open_barrier(*args, **kwargs):
+        raise AssertionError("A live database was opened: chromadb.PersistentClient was called!")
+
+    with patch("chromadb.PersistentClient", side_effect=db_open_barrier) as mock_client:
+        saved_modules = {}
+        for mod_name in list(sys.modules):
+            if mod_name in ("migrate_v2.build_v2", "db") or mod_name.startswith("db."):
+                saved_modules[mod_name] = sys.modules.pop(mod_name)
+        try:
+            import migrate_v2.build_v2
+            assert "db" not in sys.modules, "importing migrate_v2.build_v2 must not import db!"
+            mock_client.assert_not_called()
+
+            # Calling validate_destination_persisted_identity for a temporary destination
+            # must also not import db or open the live database.
+            dest_dir = tmp_path / "temp_dest_identity"
+            dest_dir.mkdir()
+            manifest_content = {
+                "schema_version": 2,
+                "backend": "ollama",
+                "model": "bge-m3",
+                "model_digest": "sha256:test_digest_123",
+                "dimension": 1024,
+                "distance": "cosine",
+                "normalization": False,
+            }
+            (dest_dir / "graphify_manifest.json").write_text(json.dumps(manifest_content), encoding="utf-8")
+
+            mock_dest_col = Mock()
+            mock_dest_col.metadata = manifest_content
+            mock_dest_col.count.return_value = 0
+            mock_dest_client = Mock()
+            mock_dest_client.get_collection.return_value = mock_dest_col
+
+            migrate_v2.build_v2.validate_destination_persisted_identity(
+                out_dir=dest_dir,
+                col_name="graphify",
+                expected_model="bge-m3",
+                expected_digest="sha256:test_digest_123",
+                expected_dimension=1024,
+                expected_backend="ollama",
+                expected_schema_version=2,
+                expected_distance="cosine",
+                expected_normalization=False,
+                client=mock_dest_client,
+            )
+
+            assert "db" not in sys.modules, "validate_destination_persisted_identity must not import db!"
+            mock_client.assert_not_called()
+        finally:
+            for mod_name, mod in saved_modules.items():
+                sys.modules[mod_name] = mod
+
+
+def test_sync_rejects_conflicting_prefixed_fields_in_completion_marker_before_restore(tmp_path):
+    """Regression test (Finding 5): sync rejects restoring completion marker with conflicting prefixed fields."""
+    from migrate_v2.build_v2 import _validate_completion_marker_identity
+
+    valid_identity = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:fake_digest_123",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+
+    # 1. Conflicting prefixed model field within marker
+    marker_conflict_model = dict(valid_identity, **{"graphify:model": "all-MiniLM-L6-v2"})
+    assert not _validate_completion_marker_identity(marker_conflict_model, valid_identity)
+
+    # 2. Conflicting prefixed dimension field within marker
+    marker_conflict_dim = dict(valid_identity, **{"graphify:dimension": 384})
+    assert not _validate_completion_marker_identity(marker_conflict_dim, valid_identity)
+
+    # 3. Invalid float dimension field
+    marker_bad_dim = dict(valid_identity, **{"graphify:dimension": 1024.9})
+    assert not _validate_completion_marker_identity(marker_bad_dim, valid_identity)
+
+    # 4. In run_sync, a completion marker with conflicting prefixed field triggers rebuild and is NOT restored as-is
+    v1_dir = tmp_path / "v1_sync_conflict"
+    v1_dir.mkdir()
+    create_mock_v1_db(v1_dir, collection_name="graphify")
+
+    v2_dir = tmp_path / "v2_sync_conflict"
+    v2_dir.mkdir()
+
+    dummy_ef = _DummyEF()
+    import chromadb
+    c_client = chromadb.PersistentClient(path=str(v2_dir))
+    fake_vec = [0.1] * 1024
+    c_col = c_client.create_collection(
+        "graphify",
+        metadata={
+            "model": "bge-m3",
+            "model_digest": "sha256:fake_digest_123",
+            "dimension": 1024,
+            "backend": "ollama",
+            "schema_version": 2,
+            "distance": "cosine",
+            "normalization": False,
+        },
+        embedding_function=dummy_ef,
+    )
+
+    from migrate_v2.build_v2 import read_v1_records, compute_corpus_hash
+    col_name, col_meta, col_config, v1_mtime, v1_records = read_v1_records(v1_dir)
+    corpus_hash = compute_corpus_hash(v1_records)
+
+    c_col.add(
+        ids=[r["id"] for r in v1_records],
+        embeddings=[fake_vec for _ in v1_records],
+        documents=[r["document"] for r in v1_records],
+        metadatas=[r["metadata"] for r in v1_records],
+    )
+
+    create_mock_keyword_index(v2_dir, v1_records)
+    kw_file = v2_dir / "keyword_index.sqlite3"
+    kw_mtime_gen = str(int(kw_file.stat().st_mtime))
+
+    manifest_data = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:fake_digest_123",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+        "corpus_hash": corpus_hash,
+        "keyword_index_generation": kw_mtime_gen,
+        "total_records": len(v1_records),
+        "v1_sqlite_mtime": v1_mtime,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    # Marker backup has conflicting graphify:model field
+    conflict_marker_data = dict(manifest_data)
+    conflict_marker_data["graphify:model"] = "all-MiniLM-L6-v2"
+    conflict_marker_data["timestamps"] = {"completed_at": "2026-10-28T12:00:00Z"}
+    complete_file = v2_dir / "build_complete.json"
+    complete_file.write_text(json.dumps(conflict_marker_data), encoding="utf-8")
+
+    mock_embedder = Mock()
+    mock_embedder.encode.return_value = [fake_vec]
+
+    with patch("migrate_v2.build_v2.get_ollama_model_digest", return_value="sha256:fake_digest_123"), \
+         patch("embedders.get_ollama_model_digest", return_value="sha256:fake_digest_123"), \
+         patch("migrate_v2.build_v2.build_embedder", return_value=mock_embedder), \
+         patch("migrate_v2.build_v2.build_chroma_embedding_function", return_value=dummy_ef), \
+         patch("migrate_v2.build_v2.rebuild_keyword_index_subprocess") as mock_kw_rebuild:
+        run_sync(v1_dir, v2_dir)
+
+    assert mock_kw_rebuild.called, "rebuild_keyword_index_subprocess MUST be called when completion marker has conflicting prefixed field!"
+    restored_marker = json.loads(complete_file.read_text(encoding="utf-8"))
+    assert restored_marker.get("model") == "bge-m3"
+    assert restored_marker.get("graphify:model") in (None, "bge-m3")
+
+

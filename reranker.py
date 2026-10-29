@@ -103,10 +103,11 @@ class Reranker:
                         encodings = self.tokenizer.encode_batch(chunk)
                         input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
                         attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
-                        res = self.session.run(None, {
-                            "input_ids": input_ids,
-                            "attention_mask": attention_mask
-                        })
+                        with contextlib.redirect_stdout(sys.stderr):
+                            res = self.session.run(None, {
+                                "input_ids": input_ids,
+                                "attention_mask": attention_mask
+                            })
                         output_holder.append(res)
                     except BaseException as ex:
                         error_holder.append(ex)
@@ -395,12 +396,23 @@ def _load_cpu_reranker(fallback_reason: Optional[str] = None, preloaded_tok: Opt
         import onnxruntime as ort
         sess_options = ort.SessionOptions()
         sess_options.intra_op_num_threads = _get_rerank_threads()
-        session = ort.InferenceSession(model_path, sess_options=sess_options, providers=["CPUExecutionProvider"])
+        with contextlib.redirect_stdout(sys.stderr):
+            session = ort.InferenceSession(model_path, sess_options=sess_options, providers=["CPUExecutionProvider"])
     except Exception as e:
         err_msg = f"load error: failed to initialize onnxruntime session: {e}"
         if fallback_reason:
             return None, f"{fallback_reason}; CPU fallback session failed: {err_msg}"
         return None, err_msg
+
+    if hasattr(session, "disable_fallback"):
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                session.disable_fallback()
+        except Exception as e:
+            err_msg = f"failed to disable fallback: {e}"
+            if fallback_reason:
+                return None, f"{fallback_reason}; CPU fallback session failed: {err_msg}"
+            return None, err_msg
 
     if fallback_reason:
         logging.getLogger(__name__).warning("reranker: CPU int8 is used instead of CUDA: %s", fallback_reason)

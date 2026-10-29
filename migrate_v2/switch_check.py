@@ -178,8 +178,14 @@ def check_v2_identity(v2_dir: Path) -> dict:
     except Exception as e:
         return {"status": "FAIL", "error": f"Baza kolleksiyasini o'qishda xatolik: {e}"}
 
-    from db import _check_identity_conflict, _parse_int, _parse_bool
+    from identity_utils import _check_identity_conflict, _parse_int, _parse_bool, _check_source_internal_conflict
     from embedders import ModelIdentityError
+
+    try:
+        _check_source_internal_conflict(col_meta, "Kolleksiya")
+        _check_source_internal_conflict(manifest_identity, "Manifest")
+    except ModelIdentityError as e:
+        return {"status": "FAIL", "error": str(e)}
 
     keys_to_extract = [
         ("backend", str),
