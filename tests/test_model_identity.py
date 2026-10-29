@@ -4,6 +4,7 @@ All tests use temporary directories, mock Ollama / network, and never touch live
 """
 
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -335,3 +336,118 @@ def test_align_chroma_collection_configuration_removes_default(tmp_path):
     ef = updated["keys"]["#embedding"]["float_list"]["vector_index"]["embedding_function"]
     assert ef == {"type": "legacy"}
     assert "default" not in updated_schema_str
+
+def test_get_db_identity_propagates_read_errors_and_never_falls_back():
+    """Finding 3: Read errors during identity lookup must be propagated, never swallowed into legacy fallback."""
+    mock_client = Mock()
+    mock_client.get_collection.side_effect = RuntimeError("Disk I/O error reading SQLite")
+
+    with pytest.raises(RuntimeError, match="Disk I/O error"):
+        db.get_db_identity(client=mock_client)
+
+    # When opening collection with a read error, it propagates out and never calls get_or_create_collection
+    with pytest.raises(RuntimeError, match="Disk I/O error"):
+        db._open_collection(mock_client)
+    mock_client.get_or_create_collection.assert_not_called()
+
+    # Confirmed absent collection does NOT raise and takes legacy path (returns None)
+    import chromadb.errors
+    absent_client = Mock()
+    absent_client.get_collection.side_effect = chromadb.errors.NotFoundError("Collection graphify does not exist")
+    assert db.get_db_identity(client=absent_client) is None
+
+
+def test_build_identity_embedder_rejects_unsupported_local_model():
+    """Finding 4: Local identity with an unsupported model name must be rejected."""
+    bad_id = {
+        "schema_version": 2,
+        "backend": "local",
+        "model": "unsupported-transformer-model",
+        "dimension": 384,
+    }
+    with pytest.raises(ModelIdentityError, match="Qo'llab-quvvatlanmagan lokal model"):
+        build_identity_embedder(bad_id)
+
+    # Supported local model name succeeds (with mocked encode)
+    good_id = {
+        "schema_version": 2,
+        "backend": "local",
+        "model": "all-MiniLM-L6-v2",
+        "dimension": 384,
+    }
+    with patch.object(embedders.LocalEmbedder, "encode", return_value=np.ones((1, 384), dtype=np.float32)):
+        embedder = build_identity_embedder(good_id)
+        assert embedder is not None
+
+def test_get_db_identity_propagates_tenant_not_found_errors():
+    """Finding 3 regression (TOPILMA 1): RuntimeError('tenant not found') must be propagated, never swallowed into None."""
+    mock_client = Mock()
+    mock_client.get_collection.side_effect = RuntimeError("tenant not found")
+
+    with pytest.raises(RuntimeError, match="tenant not found"):
+        db.get_db_identity(client=mock_client)
+
+    with pytest.raises(RuntimeError, match="tenant not found"):
+        db._open_collection(mock_client)
+    mock_client.get_or_create_collection.assert_not_called()
+
+    # Also test NotFoundError containing tenant
+    import chromadb.errors
+    tenant_err_client = Mock()
+    tenant_err_client.get_collection.side_effect = chromadb.errors.NotFoundError("tenant default_tenant not found")
+
+    with pytest.raises(chromadb.errors.NotFoundError, match="tenant default_tenant not found"):
+        db.get_db_identity(client=tenant_err_client)
+def test_build_identity_embedder_local_accepts_canonical_variants_and_rejects_others():
+    """Finding 4 regression: Canonical local model names succeed while any other name raises ModelIdentityError."""
+    supported = ["all-MiniLM-L6-v2", "sentence-transformers/all-minilm-l6-v2", "ALL-MINILM-L6-V2 "]
+    for model_name in supported:
+        identity = {
+            "schema_version": 2,
+            "backend": "local",
+            "model": model_name,
+            "dimension": 384,
+        }
+        with patch.object(embedders.LocalEmbedder, "encode", return_value=np.ones((1, 384), dtype=np.float32)):
+            emb = build_identity_embedder(identity)
+            assert emb is not None
+
+    unsupported = ["bert-base-uncased", "text-embedding-ada-002", "nomic-embed-text"]
+    for model_name in unsupported:
+        bad_id = {
+            "schema_version": 2,
+            "backend": "local",
+            "model": model_name,
+            "dimension": 384,
+        }
+        with pytest.raises(ModelIdentityError, match="Qo'llab-quvvatlanmagan lokal model"):
+            build_identity_embedder(bad_id)
+
+
+def test_get_db_identity_raises_when_collections_table_has_graphify_but_metadata_table_missing_regression_finding_6(tmp_path):
+    """Finding 6 regression: only confirmed absent collection bypasses identity lookup; missing collection_metadata raises OperationalError when collection exists."""
+    db_file = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_file))
+    cur = conn.cursor()
+    # collections table exists and has graphify collection, but collection_metadata table is missing
+    cur.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);")
+    cur.execute("INSERT INTO collections VALUES ('col-1', 'graphify');")
+    conn.commit()
+    conn.close()
+
+    # Must NOT swallow into None! Must raise OperationalError because collection exists!
+    with pytest.raises(sqlite3.OperationalError, match="no such table: collection_metadata"):
+        db.get_db_identity(db_path=str(tmp_path))
+
+    # Conversely, if collections has no graphify collection, it is confirmed absent -> returns None
+    conn = sqlite3.connect(str(db_file))
+    cur = conn.cursor()
+    cur.execute("DELETE FROM collections WHERE name = 'graphify';")
+    cur.execute("INSERT INTO collections VALUES ('col-other', 'other_collection');")
+    conn.commit()
+    conn.close()
+
+    res = db.get_db_identity(db_path=str(tmp_path))
+    assert res is None
+
+

@@ -279,6 +279,12 @@ def build_identity_embedder(identity: dict, base_url: str = None) -> EmbedderBas
         except Exception as e:
             raise ModelIdentityError(f"Ollama embedder yaratib bo'lmadi: {e}") from e
     elif backend == "local":
+        supported_local = {"all-minilm-l6-v2", "sentence-transformers/all-minilm-l6-v2"}
+        if model.strip().lower() not in supported_local:
+            raise ModelIdentityError(
+                f"Qo'llab-quvvatlanmagan lokal model: '{model}'. "
+                f"Faqat quyidagilar qo'llab-quvvatlanadi: {', '.join(sorted(supported_local))}"
+            )
         embedder = LocalEmbedder()
     elif backend == "openai":
         cfg = load_models_config()

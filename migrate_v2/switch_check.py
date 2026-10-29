@@ -10,6 +10,7 @@ Performs NO switch and modifies NO files or processes.
 import argparse
 import json
 import os
+import sqlite3
 import re
 import subprocess
 import sys
@@ -30,7 +31,7 @@ def find_running_graphify_processes() -> list[dict]:
         ps_cmd = (
             "Get-CimInstance Win32_Process | "
             "Where-Object { $_.Name -like '*python*' } | "
-            "Select-Object ProcessId, CommandLine | "
+            "Select-Object ProcessId, Name, CommandLine | "
             "ConvertTo-Json -Compress"
         )
         try:
@@ -48,10 +49,9 @@ def find_running_graphify_processes() -> list[dict]:
                     for item in data:
                         cmd = item.get("CommandLine") or ""
                         pid = item.get("ProcessId")
+                        name = item.get("Name") or "python.exe"
                         if any(k in cmd.lower() for k in ["server.py", "server_http.py", "bot"]):
-                            # Strip out any potential secret flags from cmd representation
-                            safe_cmd = re.sub(r"(--api-key|--token|--key|PASSWORD)=[^\s]+", r"\1=***", cmd)
-                            matches.append({"pid": pid, "command": safe_cmd})
+                            matches.append({"pid": pid, "executable": name})
                 except Exception:
                     pass
         except Exception:
@@ -122,7 +122,7 @@ def check_v1_manifest_drift(v1_dir: Path, v2_dir: Path) -> dict:
 
 
 def check_v2_identity(v2_dir: Path) -> dict:
-    """Self-test v2 database identity."""
+    """Self-test v2 database identity: requires DB file and compares persisted collection identity with manifest."""
     manifest_file = v2_dir / "graphify_manifest.json"
     if not manifest_file.exists():
         return {
@@ -132,22 +132,219 @@ def check_v2_identity(v2_dir: Path) -> dict:
 
     try:
         with open(manifest_file, "r", encoding="utf-8") as f:
-            identity = json.load(f)
+            manifest_identity = json.load(f)
     except Exception as e:
         return {"status": "FAIL", "error": f"Manifest o'qishda xatolik: {e}"}
+
+    if not isinstance(manifest_identity, dict):
+        return {"status": "FAIL", "error": "Manifest fayli yaroqsiz (JSON lug'at emas)"}
+
+    db_file = v2_dir / "chroma.sqlite3"
+    if not db_file.exists():
+        return {
+            "status": "FAIL",
+            "error": f"Chroma ma'lumotlar bazasi fayli topilmadi: {db_file}",
+        }
+
+    try:
+        conn = sqlite3.connect(f"file:{db_file.as_posix()}?mode=ro", uri=True, timeout=5.0)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id, name FROM collections")
+            col_rows = cur.fetchall()
+            if not col_rows:
+                return {"status": "FAIL", "error": f"Bazada birorta ham kolleksiya topilmadi: {db_file}"}
+
+            target_id = None
+            for cid, cname in col_rows:
+                if cname == "graphify":
+                    target_id = cid
+                    break
+            if not target_id:
+                return {"status": "FAIL", "error": f"Bazada 'graphify' kolleksiyasi topilmadi: {db_file}"}
+
+            cur.execute("""
+                SELECT key, str_value, int_value, float_value, bool_value
+                FROM collection_metadata
+                WHERE collection_id = ?
+            """, (target_id,))
+            rows = cur.fetchall()
+            col_meta = {}
+            for k, s, i, f, b in rows:
+                val = bool(b) if b is not None else i if i is not None else f if f is not None else s
+                col_meta[k] = val
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"status": "FAIL", "error": f"Baza kolleksiyasini o'qishda xatolik: {e}"}
+
+    from db import _check_identity_conflict, _parse_int, _parse_bool
+    from embedders import ModelIdentityError
+
+    keys_to_extract = [
+        ("backend", str),
+        ("model", str),
+        ("dimension", _parse_int),
+        ("model_digest", str),
+        ("schema_version", _parse_int),
+        ("distance", str),
+        ("normalization", _parse_bool),
+    ]
+
+    resolved_c = {}
+    for key, cast_type in keys_to_extract:
+        val_plain = col_meta.get(key)
+        val_pref = col_meta.get(f"graphify:{key}")
+        if val_plain is not None and val_pref is not None:
+            differ = False
+            try:
+                c1 = cast_type(val_plain)
+                c2 = cast_type(val_pref)
+                differ = (c1 != c2)
+            except Exception:
+                differ = True
+            if differ:
+                return {"status": "FAIL", "error": f"Kolleksiyada '{key}' va 'graphify:{key}' qiymatlari mos kelmadi: {val_plain} != {val_pref}"}
+            resolved_c[key] = val_plain
+        else:
+            resolved_c[key] = val_plain if val_plain is not None else val_pref
+
+    c_backend = resolved_c["backend"]
+    c_model = resolved_c["model"]
+    c_dim = resolved_c["dimension"]
+    c_digest = resolved_c["model_digest"]
+    c_schema = resolved_c["schema_version"]
+    c_dist = resolved_c["distance"]
+    c_norm = resolved_c["normalization"]
+
+    if not c_backend:
+        return {"status": "FAIL", "error": "Baza kolleksiyasida 'backend' identifikatsiyasi topilmadi"}
+    if not c_model:
+        return {"status": "FAIL", "error": "Baza kolleksiyasida 'model' identifikatsiyasi topilmadi"}
+    if c_dim is None:
+        return {"status": "FAIL", "error": "Baza kolleksiyasida 'dimension' identifikatsiyasi topilmadi"}
+    if str(c_backend).lower() == "ollama" and not c_digest:
+        return {"status": "FAIL", "error": "Baza kolleksiyasida Ollama uchun 'model_digest' topilmadi"}
+    if c_schema is None:
+        return {"status": "FAIL", "error": "Baza kolleksiyasida 'schema_version' topilmadi"}
+    if not c_dist:
+        return {"status": "FAIL", "error": "Baza kolleksiyasida 'distance' topilmadi"}
+    if c_norm is None:
+        return {"status": "FAIL", "error": "Baza kolleksiyasida 'normalization' topilmadi"}
+
+    resolved_m = {}
+    for key, cast_type in keys_to_extract:
+        val_plain = manifest_identity.get(key)
+        val_pref = manifest_identity.get(f"graphify:{key}")
+        if val_plain is not None and val_pref is not None:
+            differ = False
+            try:
+                c1 = cast_type(val_plain)
+                c2 = cast_type(val_pref)
+                differ = (c1 != c2)
+            except Exception:
+                differ = True
+            if differ:
+                return {"status": "FAIL", "error": f"Manifestda '{key}' va 'graphify:{key}' qiymatlari mos kelmadi: {val_plain} != {val_pref}"}
+            resolved_m[key] = val_plain
+        else:
+            resolved_m[key] = val_plain if val_plain is not None else val_pref
+
+    m_backend = resolved_m["backend"]
+    m_model = resolved_m["model"]
+    m_dim = resolved_m["dimension"]
+    m_digest = resolved_m["model_digest"]
+    m_schema = resolved_m["schema_version"]
+    m_dist = resolved_m["distance"]
+    m_norm = resolved_m["normalization"]
+
+    if not m_backend or str(m_backend).lower() != str(c_backend).lower():
+        return {"status": "FAIL", "error": f"Backend mos kelmadi: manifest={m_backend}, kolleksiya={c_backend}"}
+    if not m_model or str(m_model) != str(c_model):
+        return {"status": "FAIL", "error": f"Model nomi mos kelmadi: manifest={m_model}, kolleksiya={c_model}"}
+    if m_dim is None:
+        return {"status": "FAIL", "error": "Manifestda 'dimension' topilmadi"}
+
+    try:
+        m_dim_int = _parse_int(m_dim)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "FAIL", "error": f"Manifestda 'dimension' noto'g'ri formatda: {m_dim}"}
+
+    try:
+        c_dim_int = _parse_int(c_dim)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "FAIL", "error": f"Baza kolleksiyasida 'dimension' noto'g'ri formatda: {c_dim}"}
+
+    if m_dim_int != c_dim_int:
+        return {"status": "FAIL", "error": f"Dimension mos kelmadi: manifest={m_dim}, kolleksiya={c_dim}"}
+
+    if str(c_backend).lower() == "ollama" and str(m_digest) != str(c_digest):
+        return {"status": "FAIL", "error": f"Model digest mos kelmadi: manifest={m_digest}, kolleksiya={c_digest}"}
+
+    if m_schema is None:
+        return {"status": "FAIL", "error": "Manifestda 'schema_version' topilmadi"}
+
+    try:
+        m_schema_int = _parse_int(m_schema)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "FAIL", "error": f"Manifestda 'schema_version' noto'g'ri formatda: {m_schema}"}
+
+    try:
+        c_schema_int = _parse_int(c_schema)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "FAIL", "error": f"Baza kolleksiyasida 'schema_version' noto'g'ri formatda: {c_schema}"}
+
+    if m_schema_int != c_schema_int:
+        return {"status": "FAIL", "error": f"schema_version mos kelmadi: manifest={m_schema}, kolleksiya={c_schema}"}
+
+    if not m_dist or str(m_dist).lower() != str(c_dist).lower():
+        return {"status": "FAIL", "error": f"distance mos kelmadi: manifest={m_dist}, kolleksiya={c_dist}"}
+
+    if m_norm is None:
+        return {"status": "FAIL", "error": "Manifestda 'normalization' topilmadi"}
+
+    def _parse_bool(val):
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, int) and val in (0, 1):
+            return bool(val)
+        s = str(val).strip().lower()
+        if s in ("true", "1"):
+            return True
+        if s in ("false", "0"):
+            return False
+        raise ValueError(f"Noto'g'ri boolean qiymat: {val}")
+
+    try:
+        norm_m = _parse_bool(m_norm)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "FAIL", "error": f"Manifestda 'normalization' noto'g'ri formatda: {m_norm}"}
+
+    try:
+        norm_c = _parse_bool(c_norm)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "FAIL", "error": f"Baza kolleksiyasida 'normalization' noto'g'ri formatda: {c_norm}"}
+
+    if norm_m != norm_c:
+        return {"status": "FAIL", "error": f"normalization mos kelmadi: manifest={m_norm}, kolleksiya={c_norm}"}
+
+    try:
+        _check_identity_conflict(manifest_identity, "manifest", col_meta, "kolleksiya")
+    except ModelIdentityError as e:
+        return {"status": "FAIL", "error": str(e)}
 
     from embedders import build_identity_embedder
 
     try:
-        embedder = build_identity_embedder(identity)
+        embedder = build_identity_embedder(manifest_identity)
         test_vec = embedder.encode(["self-test"])
         dim = len(test_vec[0]) if hasattr(test_vec[0], "__len__") else len(test_vec)
         return {
             "status": "PASS",
-            "model": identity.get("model"),
-            "backend": identity.get("backend"),
+            "model": manifest_identity.get("model"),
+            "backend": manifest_identity.get("backend"),
             "dimension": dim,
-            "digest": identity.get("model_digest"),
+            "digest": manifest_identity.get("model_digest"),
         }
     except Exception as e:
         return {"status": "FAIL", "error": str(e)}
@@ -201,7 +398,17 @@ def print_checklist(
     if processes:
         print(f"   ??  Topildi: {len(processes)} ta faol jarayon:")
         for p in processes:
-            print(f"      - PID {p['pid']}: {p['command'][:90]}")
+            exe = p.get("executable")
+            if not exe and "command" in p:
+                raw_cmd = p["command"].strip()
+                if raw_cmd.startswith('"'):
+                    exe = raw_cmd[1:].split('"', 1)[0]
+                else:
+                    exe = raw_cmd.split()[0]
+                exe = Path(exe).name
+            if not exe:
+                exe = "python"
+            print(f"      - PID {p['pid']}: {exe}")
         print("   -> O'tishdan oldin ushbu yozuvchi jarayonlar to'xtatilishi shart.")
     else:
         print("   ? Faol Graphify yozuvchi jarayonlari topilmadi.")
