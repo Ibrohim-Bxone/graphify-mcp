@@ -19,6 +19,8 @@ def clean_reranker_state(monkeypatch):
     monkeypatch.delenv("GRAPHIFY_RERANKER_MODEL", raising=False)
     monkeypatch.delenv("GRAPHIFY_RERANK_BUDGET_S", raising=False)
     monkeypatch.delenv("GRAPHIFY_RERANK", raising=False)
+    monkeypatch.delenv("GRAPHIFY_RERANK_DEVICE", raising=False)
+    monkeypatch.delenv("GRAPHIFY_RERANK_THREADS", raising=False)
     yield
     reset_reranker()
 
@@ -74,6 +76,7 @@ def test_thread_safe_singleton():
 
 
 def test_tokenizer_pad_id_and_max_length_read_from_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_RERANK_DEVICE", "cpu")  # real CUDA on the host must not reach the mocked session
     tok_json = tmp_path / "tokenizer.json"
     tok_cfg = tmp_path / "tokenizer_config.json"
     model_file = tmp_path / "model.onnx"
@@ -167,6 +170,7 @@ def test_load_error_handling(tmp_path, monkeypatch):
 
 
 def test_tokenizer_model_max_length_8192_capped_to_512(tmp_path, monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_RERANK_DEVICE", "cpu")  # real CUDA on the host must not reach the mocked session
     tok_json = tmp_path / "tokenizer.json"
     tok_cfg = tmp_path / "tokenizer_config.json"
     model_file = tmp_path / "model.onnx"
@@ -385,3 +389,363 @@ def test_finding6_score_pairs_returns_tuple_per_request():
     scores_err, err_msg = r.score_pairs([("q", "d")], budget_s=-1.0)
     assert scores_err is None
     assert err_msg == "budget exceeded"
+
+
+def _setup_dummy_model_files(tmp_path, include_fp16=True):
+    tok_json = tmp_path / "tokenizer.json"
+    tok_cfg = tmp_path / "tokenizer_config.json"
+    tok_cfg.write_text(json.dumps({"pad_token_id": 99, "max_length": 512}), encoding="utf-8")
+    tok_json.write_text(json.dumps({"version": "1.0", "truncation": {"max_length": 512}, "padding": {"pad_id": 99}}), encoding="utf-8")
+    onnx_dir = tmp_path / "onnx"
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+    int8_file = onnx_dir / "model_int8.onnx"
+    int8_file.write_bytes(b"dummy int8 onnx")
+    fp16_file = onnx_dir / "model_fp16.onnx"
+    if include_fp16:
+        fp16_file.write_bytes(b"dummy fp16 onnx")
+    return int8_file, fp16_file, tok_json, tok_cfg
+
+
+def test_auto_device_with_cuda_available_loads_fp16_cuda(tmp_path):
+    int8_file, fp16_file, tok_json, tok_cfg = _setup_dummy_model_files(tmp_path)
+
+    mock_preload = Mock()
+    mock_session = Mock()
+    mock_session.get_providers.return_value = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    mock_tok = Mock()
+
+    def mock_hf_cache(repo_id, filename, revision):
+        if filename == "onnx/model_fp16.onnx":
+            return str(fp16_file)
+        if filename == "onnx/model_int8.onnx":
+            return str(int8_file)
+        if filename == "tokenizer.json":
+            return str(tok_json)
+        if filename == "tokenizer_config.json":
+            return str(tok_cfg)
+        return None
+
+    import onnxruntime
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
+        with patch.object(onnxruntime, "get_available_providers", return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]):
+            with patch.object(onnxruntime, "preload_dlls", mock_preload, create=True):
+                with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
+                    with patch("onnxruntime.InferenceSession", return_value=mock_session) as mock_inf_cls:
+                        inst, err = get_reranker_with_reason()
+                        assert err is None
+                        assert inst is not None
+                        assert inst.device == "cuda"
+                        assert inst.fallback_reason is None
+                        assert "model_fp16.onnx" in inst.model_path
+                        mock_preload.assert_called_once()
+                        mock_inf_cls.assert_called_once()
+                        mock_session.disable_fallback.assert_called_once()
+                        _, kwargs = mock_inf_cls.call_args
+                        assert kwargs.get("providers") == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+
+def test_cuda_listed_but_session_lands_on_cpu_fallback_with_reason(tmp_path):
+    int8_file, fp16_file, tok_json, tok_cfg = _setup_dummy_model_files(tmp_path)
+
+    mock_cuda_session = Mock()
+    mock_cuda_session.get_providers.return_value = ["CPUExecutionProvider"]
+
+    mock_cpu_session = Mock()
+    mock_cpu_session.get_providers.return_value = ["CPUExecutionProvider"]
+
+    mock_tok = Mock()
+
+    def mock_hf_cache(repo_id, filename, revision):
+        if filename == "onnx/model_fp16.onnx":
+            return str(fp16_file)
+        if filename == "onnx/model_int8.onnx":
+            return str(int8_file)
+        if filename == "tokenizer.json":
+            return str(tok_json)
+        if filename == "tokenizer_config.json":
+            return str(tok_cfg)
+        return None
+
+    import onnxruntime
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
+        with patch.object(onnxruntime, "get_available_providers", return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]):
+            with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
+                with patch("onnxruntime.InferenceSession", side_effect=[mock_cuda_session, mock_cpu_session]):
+                    inst, err = get_reranker_with_reason()
+                    assert err is None
+                    assert inst is not None
+                    assert inst.device == "cpu"
+                    assert inst.fallback_reason is not None
+                    assert "silently on CPU" in inst.fallback_reason
+                    assert "model_int8.onnx" in inst.model_path
+
+
+def test_fp16_file_missing_falls_back_to_cpu_with_reason(tmp_path):
+    int8_file, _, tok_json, tok_cfg = _setup_dummy_model_files(tmp_path, include_fp16=False)
+
+    mock_cpu_session = Mock()
+    mock_cpu_session.get_providers.return_value = ["CPUExecutionProvider"]
+    mock_tok = Mock()
+
+    def mock_hf_cache(repo_id, filename, revision):
+        if filename == "onnx/model_fp16.onnx":
+            return None
+        if filename == "onnx/model_int8.onnx":
+            return str(int8_file)
+        if filename == "tokenizer.json":
+            return str(tok_json)
+        if filename == "tokenizer_config.json":
+            return str(tok_cfg)
+        return None
+
+    import onnxruntime
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
+        with patch.object(onnxruntime, "get_available_providers", return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]):
+            with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
+                with patch("onnxruntime.InferenceSession", return_value=mock_cpu_session):
+                    inst, err = get_reranker_with_reason()
+                    assert err is None
+                    assert inst is not None
+                    assert inst.device == "cpu"
+                    assert inst.fallback_reason is not None
+                    assert "fp16 model missing" in inst.fallback_reason
+                    assert "model_int8.onnx" in inst.model_path
+
+
+def test_device_cpu_forces_cpu_path_without_cuda(tmp_path, monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_RERANK_DEVICE", "cpu")
+    int8_file, fp16_file, tok_json, tok_cfg = _setup_dummy_model_files(tmp_path)
+
+    mock_session = Mock()
+    mock_session.get_providers.return_value = ["CPUExecutionProvider"]
+    mock_tok = Mock()
+
+    def mock_hf_cache(repo_id, filename, revision):
+        if filename == "onnx/model_fp16.onnx":
+            return str(fp16_file)
+        if filename == "onnx/model_int8.onnx":
+            return str(int8_file)
+        if filename == "tokenizer.json":
+            return str(tok_json)
+        if filename == "tokenizer_config.json":
+            return str(tok_cfg)
+        return None
+
+    import onnxruntime
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
+        with patch.object(onnxruntime, "get_available_providers", return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]):
+            with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
+                with patch("onnxruntime.InferenceSession", return_value=mock_session) as mock_inf_cls:
+                    inst, err = get_reranker_with_reason()
+                    assert err is None
+                    assert inst is not None
+                    assert inst.device == "cpu"
+                    assert inst.fallback_reason is None
+                    assert "model_int8.onnx" in inst.model_path
+                    mock_inf_cls.assert_called_once()
+                    _, kwargs = mock_inf_cls.call_args
+                    assert kwargs.get("providers") == ["CPUExecutionProvider"]
+
+
+def test_runtime_cuda_error_returns_no_rerank_with_reason():
+    mock_session = Mock()
+    mock_session.run.side_effect = RuntimeError("CUDA out of memory: tried to allocate 2.00 GiB")
+    mock_tok = Mock()
+
+    class DummyEnc:
+        def __init__(self):
+            self.ids = [1, 2]
+            self.attention_mask = [1, 1]
+
+    mock_tok.encode_batch.side_effect = lambda batch: [DummyEnc() for _ in batch]
+
+    r = Reranker(session=mock_session, tokenizer=mock_tok, pad_id=1, max_length=512, device="cuda")
+    scores, err = r.score_pairs([("query", "document")])
+    assert scores is None
+    assert err is not None
+    assert "cuda" in err.lower() or "out of memory" in err.lower()
+    assert r.last_error == err
+
+
+def test_threads_env_configures_session_options(tmp_path, monkeypatch):
+    int8_file, _, tok_json, tok_cfg = _setup_dummy_model_files(tmp_path)
+    mock_tok = Mock()
+
+    def mock_hf_cache(repo_id, filename, revision):
+        if filename == "onnx/model_int8.onnx":
+            return str(int8_file)
+        if filename == "tokenizer.json":
+            return str(tok_json)
+        if filename == "tokenizer_config.json":
+            return str(tok_cfg)
+        return None
+
+    captured_options = []
+
+    def mock_session_factory(model_path, sess_options=None, providers=None):
+        captured_options.append(sess_options)
+        m = Mock()
+        m.get_providers.return_value = ["CPUExecutionProvider"]
+        return m
+
+    monkeypatch.setenv("GRAPHIFY_RERANK_DEVICE", "cpu")
+    monkeypatch.setenv("GRAPHIFY_RERANK_THREADS", "4")
+
+    import onnxruntime
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
+        with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
+            with patch("onnxruntime.InferenceSession", side_effect=mock_session_factory):
+                inst, err = get_reranker_with_reason()
+                assert err is None
+                assert inst is not None
+                assert len(captured_options) == 1
+                assert captured_options[0].intra_op_num_threads == 4
+
+    # Default without env set should be 1
+    reset_reranker()
+    monkeypatch.delenv("GRAPHIFY_RERANK_THREADS", raising=False)
+    captured_options.clear()
+
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
+        with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
+            with patch("onnxruntime.InferenceSession", side_effect=mock_session_factory):
+                inst, err = get_reranker_with_reason()
+                assert err is None
+                assert inst is not None
+                assert len(captured_options) == 1
+                assert captured_options[0].intra_op_num_threads == 1
+
+
+def test_fp16_logits_cast_to_float32_before_sigmoid():
+    mock_session = Mock()
+    mock_tok = Mock()
+
+    class DummyEnc:
+        def __init__(self):
+            self.ids = [10, 20, 1]
+            self.attention_mask = [1, 1, 0]
+
+    mock_tok.encode_batch.side_effect = lambda batch: [DummyEnc() for _ in batch]
+    mock_session.run.return_value = [np.array([[2.1972245773362196]], dtype=np.float16)]
+
+    r = Reranker(session=mock_session, tokenizer=mock_tok, pad_id=1, max_length=512, device="cuda")
+    scores, err = r.score_pairs([("q", "doc")])
+    assert err is None
+    assert scores is not None
+    assert len(scores) == 1
+    assert np.isclose(scores[0], 0.9, atol=1e-3)
+
+
+def test_preload_dlls_failure_falls_back_to_cpu(tmp_path):
+    int8_file, fp16_file, tok_json, tok_cfg = _setup_dummy_model_files(tmp_path)
+
+    mock_cpu_session = Mock()
+    mock_cpu_session.get_providers.return_value = ["CPUExecutionProvider"]
+    mock_tok = Mock()
+
+    def mock_hf_cache(repo_id, filename, revision):
+        if filename == "onnx/model_fp16.onnx":
+            return str(fp16_file)
+        if filename == "onnx/model_int8.onnx":
+            return str(int8_file)
+        if filename == "tokenizer.json":
+            return str(tok_json)
+        if filename == "tokenizer_config.json":
+            return str(tok_cfg)
+        return None
+
+    import onnxruntime
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
+        with patch.object(onnxruntime, "get_available_providers", return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]):
+            with patch.object(onnxruntime, "preload_dlls", side_effect=RuntimeError("DLL preload failed"), create=True):
+                with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
+                    with patch("onnxruntime.InferenceSession", return_value=mock_cpu_session):
+                        inst, err = get_reranker_with_reason()
+                        assert err is None
+                        assert inst is not None
+                        assert inst.device == "cpu"
+                        assert inst.fallback_reason is not None
+                        assert "preload_dlls" in inst.fallback_reason
+                        assert "model_int8.onnx" in inst.model_path
+
+
+def test_cuda_session_disables_fallback_and_epfail_reaches_error_handler(tmp_path):
+    int8_file, fp16_file, tok_json, tok_cfg = _setup_dummy_model_files(tmp_path)
+
+    mock_cuda_session = Mock()
+    mock_cuda_session.get_providers.return_value = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    mock_cuda_session.run.side_effect = RuntimeError("EPFail: CUDA kernel execution failed")
+    mock_tok = Mock()
+
+    class DummyEnc:
+        def __init__(self):
+            self.ids = [1, 2]
+            self.attention_mask = [1, 1]
+
+    mock_tok.encode_batch.side_effect = lambda batch: [DummyEnc() for _ in batch]
+
+    def mock_hf_cache(repo_id, filename, revision):
+        if filename == "onnx/model_fp16.onnx":
+            return str(fp16_file)
+        if filename == "onnx/model_int8.onnx":
+            return str(int8_file)
+        if filename == "tokenizer.json":
+            return str(tok_json)
+        if filename == "tokenizer_config.json":
+            return str(tok_cfg)
+        return None
+
+    import onnxruntime
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
+        with patch.object(onnxruntime, "get_available_providers", return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]):
+            with patch.object(onnxruntime, "preload_dlls", Mock(), create=True):
+                with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
+                    with patch("onnxruntime.InferenceSession", return_value=mock_cuda_session):
+                        inst, err = get_reranker_with_reason()
+                        assert err is None
+                        assert inst is not None
+                        assert inst.device == "cuda"
+                        mock_cuda_session.disable_fallback.assert_called_once()
+
+                        scores, score_err = inst.score_pairs([("query", "document")])
+                        assert scores is None
+                        assert score_err is not None
+                        assert "epfail" in score_err.lower() or "cuda" in score_err.lower()
+                        assert inst.last_error == score_err
+
+
+def test_disable_fallback_failure_falls_back_to_cpu(tmp_path):
+    int8_file, fp16_file, tok_json, tok_cfg = _setup_dummy_model_files(tmp_path)
+
+    mock_cuda_session = Mock()
+    mock_cuda_session.get_providers.return_value = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    mock_cuda_session.disable_fallback.side_effect = RuntimeError("disable_fallback failed")
+
+    mock_cpu_session = Mock()
+    mock_cpu_session.get_providers.return_value = ["CPUExecutionProvider"]
+    mock_tok = Mock()
+
+    def mock_hf_cache(repo_id, filename, revision):
+        if filename == "onnx/model_fp16.onnx":
+            return str(fp16_file)
+        if filename == "onnx/model_int8.onnx":
+            return str(int8_file)
+        if filename == "tokenizer.json":
+            return str(tok_json)
+        if filename == "tokenizer_config.json":
+            return str(tok_cfg)
+        return None
+
+    import onnxruntime
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=mock_hf_cache):
+        with patch.object(onnxruntime, "get_available_providers", return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]):
+            with patch.object(onnxruntime, "preload_dlls", Mock(), create=True):
+                with patch("tokenizers.Tokenizer.from_file", return_value=mock_tok):
+                    with patch("onnxruntime.InferenceSession", side_effect=[mock_cuda_session, mock_cpu_session]):
+                        inst, err = get_reranker_with_reason()
+                        assert err is None
+                        assert inst is not None
+                        assert inst.device == "cpu"
+                        assert inst.fallback_reason is not None
+                        assert "disable fallback" in inst.fallback_reason
+                        assert "model_int8.onnx" in inst.model_path
