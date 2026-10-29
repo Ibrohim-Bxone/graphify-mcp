@@ -1,3 +1,4 @@
+import os
 import re
 import math
 import sqlite3
@@ -5,9 +6,16 @@ import sys
 from collections import defaultdict
 import search_policy
 
+DENSE_WEIGHT = 1.0
+LEXICAL_WEIGHT = 0.2
+RRF_K = 60
+RERANK_ALPHA = 0.5
+RERANK_TOP_N = 20
+
 # IDF-weighted coverage chegarasi: "yetarli dalil" deb topish uchun so'rov
-# og'irligining kamida shuncha ulushi hujjatda uchrashi kerak (0.8 = 80%).
-MIN_COVERAGE = 0.8
+# og'irligining kamida shuncha ulushi hujjatda uchrashi kerak (0.5 = 50%).
+# 0.5 precision-set o'lchovi asosida tanlangan (2026-10-29): 0.8 da R@10 0.16, 0.5 da 0.50.
+MIN_COVERAGE = 0.5
 
 FUNCTIONAL_WORDS = {
     "nima", "nimaga", "qanday", "qanaqa", "qaysi", "qayerda", "qachon", "kim", "nega",
@@ -169,8 +177,7 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
     
     # 1. Fetch 50 from Vector
     vec_candidates = []
-    meta = collection.metadata or {}
-    space = meta.get("hnsw:space", "l2").lower()
+    space = similarity.collection_space(collection)
     needs_embeddings = (space == "l2" and not similarity._check_unit_length(collection))
     
     include_fields = ["documents", "metadatas", "distances"]
@@ -312,16 +319,18 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
     kw_ranked = sorted(kw_grouped.values(), key=lambda x: x["score"])
 
     # 4. RRF Merging
-    RRF_K = 60
+    dense_w = float(os.environ.get("GRAPHIFY_DENSE_WEIGHT", str(DENSE_WEIGHT)))
+    lexical_w = float(os.environ.get("GRAPHIFY_LEXICAL_WEIGHT", str(LEXICAL_WEIGHT)))
+    rrf_k = int(os.environ.get("GRAPHIFY_RRF_K", str(RRF_K)))
     rrf_scores = defaultdict(float)
     
     for rank, c in enumerate(vec_ranked):
         pid = get_parent_id(c["meta"])
-        rrf_scores[pid] += 1.0 / (RRF_K + rank + 1)
+        rrf_scores[pid] += dense_w / (rrf_k + rank + 1)
         
     for rank, c in enumerate(kw_ranked):
         pid = get_parent_id(c["meta"])
-        rrf_scores[pid] += 1.0 / (RRF_K + rank + 1)
+        rrf_scores[pid] += lexical_w / (rrf_k + rank + 1)
         
     # Combine results
     import keyword_index as _kw_mod
@@ -380,12 +389,60 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
             "text": best_c["text"],
             "meta": best_c["meta"],
             "rrf_score": rrf,
+            "fused_score": rrf,
+            "rerank_score": None,
             "similarity": vec_grouped[pid]["sim"] if pid in vec_grouped else 0.0,
             "boshqa_boshqalar": boshqa
         }
         combined.append(item)
         
-    combined.sort(key=lambda x: x["rrf_score"], reverse=True)
+    combined.sort(key=lambda x: x["fused_score"], reverse=True)
+
+    # 4.5 Rerank stage
+    # Sukut bo'yicha o'chiq: 2026-10-29 o'lchovida CPU'da p50 19 s, 45% so'rovda 20 s ichida ulgurmadi,
+    # MRR o'sishi ~0.02 (migrate_v2/out-precision). GPU bilan qayta o'lchanmaguncha faqat GRAPHIFY_RERANK=1 bilan.
+    rerank_env = os.environ.get("GRAPHIFY_RERANK", "0").strip().lower()
+    if rerank_env in ("0", "false", "off", "no"):
+        rerank_status = "off"
+        rerank_reason = "GRAPHIFY_RERANK=0"
+    else:
+        try:
+            import reranker as reranker_mod
+            r_inst, err = reranker_mod.get_reranker_with_reason()
+        except Exception as e:
+            r_inst = None
+            err = f"import error: {e}"
+
+        if r_inst is None:
+            rerank_status = "unavailable"
+            rerank_reason = err or "reranker load failed"
+        elif not combined:
+            rerank_status = "on"
+            rerank_reason = None
+        else:
+            alpha = float(os.environ.get("GRAPHIFY_RERANK_ALPHA", str(RERANK_ALPHA)))
+            top_n = int(os.environ.get("GRAPHIFY_RERANK_TOP_N", str(RERANK_TOP_N)))
+            to_rerank = combined[:top_n]
+            pairs = [(query, c["text"]) for c in to_rerank]
+            res = r_inst.score_pairs(pairs)
+            if isinstance(res, tuple):
+                scores, err = res
+            else:
+                scores, err = res, getattr(r_inst, "last_error", None)
+            if scores is None:
+                rerank_status = "unavailable"
+                rerank_reason = err or "rerank failed"
+            else:
+                rerank_status = "on"
+                rerank_reason = None
+                fused_vals = [c["fused_score"] for c in to_rerank]
+                f_max = max(fused_vals) if fused_vals else 1.0
+                for idx, c in enumerate(to_rerank):
+                    c["rerank_score"] = scores[idx]
+                    fused_norm = c["fused_score"] / f_max if f_max > 0 else 1.0
+                    c["score"] = alpha * c["rerank_score"] + (1.0 - alpha) * fused_norm
+                to_rerank.sort(key=lambda x: x["score"], reverse=True)
+                combined = to_rerank + combined[top_n:]
 
     # 5. Apply "Insufficient evidence" rule
     # So'rovga bog'liq narsalar (tokenlar, qat'iy cheklovlar, IDF og'irliklari)
@@ -412,11 +469,15 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
         return {
             "results": [],
             "status": "insufficient_evidence",
-            "related_candidates": related_candidates
+            "related_candidates": related_candidates,
+            "rerank": rerank_status,
+            "rerank_reason": rerank_reason,
         }
         
     return {
         "results": final_results,
         "status": "ok",
-        "related_candidates": related_candidates
+        "related_candidates": related_candidates,
+        "rerank": rerank_status,
+        "rerank_reason": rerank_reason,
     }

@@ -94,12 +94,21 @@ def test_unit_length_cache():
             self.get_calls += 1
             return super().get(limit=limit, include=include)
             
+    # Ishonchli o'zgarish signali yo'q: kesh ishlatilmaydi, har safar qayta tekshiriladi
     col = CounterCollection("test_col_1")
     make_scorer(col)
-    assert col.get_calls == 1
-    
     make_scorer(col)
-    assert col.get_calls == 1  # cached by name
+    assert col.get_calls == 2
+
+    # Aniq write_generation signali bor: bir avlod ichida kesh, avlod o'zgarsa qayta tekshiriladi
+    gen_col = CounterCollection("test_col_2")
+    gen_col.write_generation = 1
+    make_scorer(gen_col)
+    make_scorer(gen_col)
+    assert gen_col.get_calls == 1
+    gen_col.write_generation = 2
+    make_scorer(gen_col)
+    assert gen_col.get_calls == 2
 
 def test_make_scorer_space_from_configuration_json():
     # Chroma modify() metadata'ni to'liq almashtiradi va hnsw:space yo'qoladi; space configuration_json da qoladi

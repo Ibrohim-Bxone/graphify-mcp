@@ -6,24 +6,71 @@ import numpy as np
 _warned_non_unit = False
 _unit_length_cache = {}
 
+def _get_mutation_signal(collection, raw_col, is_db_col=False):
+    """Kolleksiyaning mutatsiya signalini oladi yoki None qaytaradi."""
+    for target in (collection, raw_col):
+        if target is None:
+            continue
+        for attr in ("mutation_signal", "seq_id", "max_seq_id", "write_generation", "generation", "version", "max_id"):
+            val = getattr(target, attr, None)
+            if callable(val):
+                try:
+                    val = val()
+                except Exception:
+                    continue
+            if val is not None:
+                return val
+        # Chroma 1.5.9 lokal kolleksiyasida _model.log_position/version yozuvdan keyin ham 0 qoladi
+        # (2026-10-29 sinovi) — ishonchli signal emas, shuning uchun ishlatilmaydi va kesh chetlab o'tiladi.
+
+    if is_db_col:
+        db = sys.modules.get("db")
+        if db is not None and hasattr(db, "get_db_mtime"):
+            try:
+                mtime = db.get_db_mtime()
+                if mtime > 0:
+                    return mtime
+            except Exception:
+                pass
+
+    return None
+
 def _check_unit_length(collection):
     """Kolleksiyadan namuna vektorlar olib, birlik uzunlikda ekanini tekshiradi."""
     global _warned_non_unit
     
-    # Kesh Chroma'ning barqaror UUID'i yoki nomi bo'yicha. Python'ning o'z
-    # id() funksiyasi ISHLATILMAYDI: obyekt GC qilingandan keyin xotiradagi
-    # o'sha manzil boshqa (butunlay boshqa bazadagi) kolleksiyaga berilishi
-    # mumkin va eski (noto'g'ri) natija qaytib qoladi. Barqaror identifikator
-    # yo'q bo'lgan obyektlar (masalan testdagi soxta kolleksiya) umuman
-    # keshlanmaydi — har safar qayta hisoblanadi, bu xavfsizroq.
-    cache_key = getattr(collection, "id", None) or getattr(collection, "name", None)
+    raw_col = collection
+    is_db_col = False
+    db = sys.modules.get("db")
+    if db is not None and (collection is getattr(db, "col", None) or collection is getattr(db, "_col", None)):
+        raw_col = db.get_collection()
+        is_db_col = True
+
+    count_fn = getattr(raw_col, "count", None) or getattr(collection, "count", None)
+    count = None
+    count_failed = False
+    if callable(count_fn):
+        try:
+            count = count_fn()
+        except Exception:
+            count_failed = True
+
+    col_id = (getattr(collection, "id", None) or getattr(raw_col, "id", None) or
+              getattr(collection, "name", None) or getattr(raw_col, "name", None))
+    mutation_signal = _get_mutation_signal(collection, raw_col, is_db_col=is_db_col)
+
+    if col_id is None or count_failed:
+        cache_key = None
+    elif count is not None:
+        if mutation_signal is not None:
+            cache_key = (str(col_id), count, mutation_signal)
+        else:
+            cache_key = None
+    else:
+        cache_key = (str(col_id), mutation_signal) if mutation_signal is not None else None
+
     if cache_key is not None and cache_key in _unit_length_cache:
         return _unit_length_cache[cache_key]
-
-    raw_col = collection
-    db = sys.modules.get("db")
-    if db is not None and collection is getattr(db, "col", None):
-        raw_col = db.get_collection()
     try:
         res = raw_col.get(limit=5, include=["embeddings"])
         embeddings = res.get("embeddings")
@@ -78,19 +125,29 @@ def distance_to_similarity(distance: float, space: str, *, query_vec=None, doc_v
     clamped_sim = max(0.0, min(1.0, sim))
     return float(clamped_sim), float(sim)
 
-def make_scorer(collection):
-    """Kolleksiya uchun mos o'xshashlik hisoblagichni yaratadi."""
-    metadata = collection.metadata or {}
-    
+def collection_space(collection) -> str:
+    """Kolleksiya fazosi (space) ni aniqlaydi: configuration_json -> metadata -> raise."""
     config = getattr(collection, "configuration_json", None)
-    hnsw_config = config.get("hnsw") if isinstance(config, dict) else None
-    space = (hnsw_config or {}).get("space") or metadata.get("hnsw:space")
+    if isinstance(config, dict):
+        hnsw_config = config.get("hnsw")
+        if isinstance(hnsw_config, dict):
+            space = hnsw_config.get("space")
+            if space:
+                return str(space).lower()
+
+    metadata = getattr(collection, "metadata", None) or {}
+    space = metadata.get("hnsw:space")
     if not space and "hnsw" in metadata and isinstance(metadata["hnsw"], dict):
         space = metadata["hnsw"].get("space")
-        
-    if not space:
-        raise ValueError("hnsw:space topilmadi, l2 deb taxmin qilinmaydi")
-        
+
+    if space:
+        return str(space).lower()
+
+    raise ValueError("hnsw:space topilmadi, l2 deb taxmin qilinmaydi")
+
+def make_scorer(collection):
+    """Kolleksiya uchun mos o'xshashlik hisoblagichni yaratadi."""
+    space = collection_space(collection)
     is_unit = True
     if space.lower() == "l2":
         is_unit = _check_unit_length(collection)
