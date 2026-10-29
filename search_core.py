@@ -398,7 +398,9 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
     combined.sort(key=lambda x: x["fused_score"], reverse=True)
 
     # 4.5 Rerank stage
-    rerank_env = os.environ.get("GRAPHIFY_RERANK", "1").strip().lower()
+    # Sukut bo'yicha o'chiq: 2026-10-29 o'lchovida CPU'da p50 19 s, 45% so'rovda 20 s ichida ulgurmadi,
+    # MRR o'sishi ~0.02 (migrate_v2/out-precision). GPU bilan qayta o'lchanmaguncha faqat GRAPHIFY_RERANK=1 bilan.
+    rerank_env = os.environ.get("GRAPHIFY_RERANK", "0").strip().lower()
     if rerank_env in ("0", "false", "off", "no"):
         rerank_status = "off"
         rerank_reason = "GRAPHIFY_RERANK=0"

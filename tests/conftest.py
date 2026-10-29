@@ -23,7 +23,10 @@ def _default_test_environment(request, monkeypatch):
         or "enable_reranker" in getattr(request, "fixturenames", [])
     )
 
-    if not is_opted_in:
+    if is_opted_in:
+        # Reranker sukut bo'yicha o'chiq; opt-in testlar uni aniq yoqadi
+        monkeypatch.setenv("GRAPHIFY_RERANK", "1")
+    else:
         monkeypatch.setenv("GRAPHIFY_RERANK", "0")
 
         def _blocked_load_reranker(*args, **kwargs):
