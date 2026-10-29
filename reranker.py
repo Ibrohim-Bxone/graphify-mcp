@@ -1,7 +1,9 @@
 """Local cross-encoder reranker using ONNX Runtime and tokenizers."""
+import contextlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from typing import Optional, List, Tuple, Any
@@ -440,7 +442,9 @@ def _load_reranker() -> Tuple[Optional[Reranker], Optional[str]]:
     preload_fn = getattr(ort, "preload_dlls", None)
     if callable(preload_fn):
         try:
-            preload_fn()
+            # ORT prints DLL and EP-fallback notices with print(); stdout is the MCP stdio channel.
+            with contextlib.redirect_stdout(sys.stderr):
+                preload_fn()
         except Exception as e:
             return _load_cpu_reranker(fallback_reason=f"ort.preload_dlls() failed: {e}")
 
@@ -460,7 +464,8 @@ def _load_reranker() -> Tuple[Optional[Reranker], Optional[str]]:
         sess_options = ort.SessionOptions()
         sess_options.intra_op_num_threads = _get_rerank_threads()
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        cuda_session = ort.InferenceSession(fp16_model_path, sess_options=sess_options, providers=providers)
+        with contextlib.redirect_stdout(sys.stderr):
+            cuda_session = ort.InferenceSession(fp16_model_path, sess_options=sess_options, providers=providers)
     except Exception as e:
         return _load_cpu_reranker(fallback_reason=f"failed to initialize CUDA session: {e}", preloaded_tok=preloaded_tok)
 
