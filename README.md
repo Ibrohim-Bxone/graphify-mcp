@@ -70,7 +70,18 @@ Keyingi barcha chatlar shu tayyor xotiradan boshlanadi.
 
 ## Embedding modelini almashtirish
 
-Standart — lokal, bepul model (kalit/internet shart emas). Dashboard'ning "Modellar" bo'limida OpenAI/Ollama/maxsus API'ga o'tsa bo'ladi — lekin bazada allaqachon ma'lumot bo'lsa, bu **buzuvchi o'zgarish**: eski vektorlar yangi model bilan mos kelmaydi. Amalda almashtirish uchun `kg_db/` ni bo'shatib, `indexer.py` bilan qayta indekslash kerak. Batafsil: [`CUSTOM_MODELS.md`](CUSTOM_MODELS.md).
+Standart v1 (jonli) holatda — `all-MiniLM-L6-v2` (384-d, lokal, bepul, internet/kalit shart emas). v2 branchida esa Ollama `bge-m3` (1024-d) modeliga o'tish tayyorlangan. Dashboard'ning "Modellar" bo'limida OpenAI/Ollama/maxsus API'ga o'tsa bo'ladi — lekin bazada allaqachon ma'lumot bo'lsa, bu **buzuvchi o'zgarish**: eski vektorlar yangi model bilan mos kelmaydi. Amalda almashtirish uchun `kg_db/` ni bo'shatib, `indexer.py` bilan qayta indekslash kerak. Batafsil: [`CUSTOM_MODELS.md`](CUSTOM_MODELS.md) va [`migrate_v2/README.md`](migrate_v2/README.md).
+
+## Tizim arxitekturasi: v1 va v2
+
+- **Hozirgi jonli holat**: v1 (jonli) — `all-MiniLM-L6-v2` (384-d, gate 0.8) modelida barqaror ishlab turibdi — v2 branchda, switch kutadi.
+- **v2 yangilanishi (`feat/graphify-v2` branchda)**:
+  - **Embedding modeli**: Ollama `bge-m3` (1024-d, ko'p tilli — o'zbek va ingliz tillarida yuqori sifat).
+  - **Model identity tekshiruvi**: Baza metama'lumotlarida model nomi va o'lchami (`bge-m3`, 1024-d) qat'iy tekshiriladi; agar Ollama yoki model mavjud bo'lmasa, qidiruv to'xtaydi (fail-closed, hech qachon noto'g'ri modelga o'tib ketmaydi).
+  - **Leksik gate (0.5)**: So'rov so'zlarining kamida 50% qamrovi (`MIN_COVERAGE = 0.5`) talab qilinadi (eski 0.8 dan tushirilgan, bu semantik moslikni to'sib qo'ymaydi).
+  - **Cross-encoder reranker**: Ixtiyoriy ONNX reranker qo'llab-quvvatlanadi, biroq resurs tejash va past kechikish uchun sukutda o'chiq (`GRAPHIFY_RERANK=0`).
+  - To'liq o'tish va sinxronizatsiya yo'riqnomasi: [`migrate_v2/README.md`](migrate_v2/README.md).
+
 
 ## Maslahatlar
 

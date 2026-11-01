@@ -39,6 +39,16 @@ Loyiha hujjatlari, spetsifikatsiya yoki eslatma fayllarini (.md, .txt) bazaga qo
 
 Qayta ishga tushirsangiz, o'sha fayllar yangilanadi (dublikat bo'lmaydi).
 
+## Tizim arxitekturasi: v1 va v2
+
+- **Hozirgi jonli holat**: v1 (jonli) — `all-MiniLM-L6-v2` (384-d, gate 0.8) modelida ishlab turibdi — v2 branchda, switch kutadi.
+- **v2 holati (`feat/graphify-v2` branchda)**:
+  - **Embedding modeli**: Ollama `bge-m3` (1024 o'lchamli, ko'p tilli — o'zbek tilidagi tavsifiy va nomli so'rovlarni ancha aniqroq tushunadi).
+  - **Model identity tekshiruvi**: Baza identifikatsiyasi (`graphify_manifest.json`) orqali tekshiriladi; agar Ollama yoki `bge-m3` topilmasa, tizim fail-closed rejimida to'xtaydi (noto'g'ri modelga tushib ketmaydi).
+  - **Leksik gate**: `MIN_COVERAGE = 0.5` (so'rov so'zlarining kamida 50% qamrovi, o'lchovlar natijasida 0.8 dan tushirilgan).
+  - **Reranker**: ONNX cross-encoder ixtiyoriy integratsiya qilingan, lekin resurs tejash uchun sukutda o'chiq (`GRAPHIFY_RERANK=0`).
+  - O'tish va sinxronizatsiya bosqichlari: [`migrate_v2/README.md`](migrate_v2/README.md) faylida.
+
 ## Maslahatlar
 
 - **Sifat > miqdor.** Hamma xom narsani emas, qaror va xulosalarni saqlang — shovqin qidiruvni buzadi.
@@ -48,4 +58,5 @@ Qayta ishga tushirsangiz, o'sha fayllar yangilanadi (dublikat bo'lmaydi).
 ## Muammo bo'lsa
 
 - Claude'da graphify tool'lari ko'rinmasa: chatda `/mcp` yozib server holatini tekshiring; Claude Code'ni qayta ishga tushiring.
-- Birinchi ishga tushishda embedding modeli (~80MB) yuklab olinadi — birinchi qidiruv sekinroq bo'lishi normal.
+- Birinchi ishga tushishda: v1 (jonli) da `all-MiniLM-L6-v2` (~80MB) yuklab olinadi, v2 da esa Ollama `bge-m3` xizmati ishlab turishi kerak — birinchi qidiruv sekinroq bo'lishi normal.
+

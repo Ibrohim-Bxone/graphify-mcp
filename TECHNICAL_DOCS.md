@@ -64,7 +64,7 @@
 | Component | Role | Technology | Cost |
 |-----------|------|-----------|------|
 | **Retrieval** | Find relevant docs | Chroma + sent-transformers | 0 tokens |
-| **Embedding** | Convert text→vectors | all-MiniLM-L6-v2 | Local (free) |
+| **Embedding** | Convert text→vectors | v1 (jonli): all-MiniLM-L6-v2 (384-d) / v2 (bge-m3 1024-d, branch) | Local (free) |
 | **Vector DB** | Store embeddings | DuckDB (persistent) | Disk space only |
 | **Generation** | Create responses | Anthropic Claude API | Pay-per-token |
 | **Orchestration** | Tie everything | Python class | Free |
@@ -82,10 +82,12 @@ INPUT: User Query
   │    └─► Split into tokens
   │
   ├─► [Embedding] (Local, 0 tokens cost)
-  │    └─► sentence-transformers converts to 384-dim vector
+  │    ├─► v1 (jonli): sentence-transformers converts to 384-dim vector (all-MiniLM-L6-v2)
+  │    └─► v2 (bge-m3 1024-d, branch): Ollama converts to 1024-dim vector (bge-m3)
   │
   ├─► [Vector Search] (Local, 0 tokens cost)
-  │    └─► Chroma: cosine similarity search
+  │    ├─► v1 (jonli): Chroma cosine similarity search (1 - d)
+  │    └─► v2 (bge-m3 1024-d, branch): Chroma L2 distance search (1 - d/2 for unit vectors)
   │        Result: Top-3 most relevant documents
   │
   ├─► [Context Building]
@@ -114,7 +116,7 @@ INPUT: User Query
     "chunk_index": 0,
     "original_doc_id": "parent_id"
   },
-  "embedding": [0.12, -0.45, 0.89, ...]  # 384 dimensions
+  "embedding": [0.12, -0.45, 0.89, ...]  # v1 (jonli): 384 dimensions (all-MiniLM-L6-v2) / v2 (bge-m3 1024-d, branch): 1024 dimensions
 }
 ```
 
@@ -139,7 +141,9 @@ INPUT: User Query
 query = "How do I use Claude API?"
 
 # Step 2: Embedding (local, no API call)
-query_embedding = embedder.encode(query)  # 384-dimensional vector
+# v1 (jonli): 384-dimensional vector (all-MiniLM-L6-v2)
+# v2 (bge-m3 1024-d, branch): 1024-dimensional vector (bge-m3 via Ollama)
+query_embedding = embedder.encode(query)
 # Cost: 0 tokens (runs locally on CPU/GPU)
 
 # Step 3: Vector Search
@@ -197,16 +201,16 @@ RAW DOCUMENTS
     │    └─► Source, title, tags, timestamp
     │
     ├─► [Embedding] - Convert to vectors
-    │    └─► sentence-transformers
-    │        Input: Text chunk (max 512 tokens)
-    │        Output: 384-dimensional embedding
-    │        Time: ~0.5ms per chunk (GPU)
+    │    ├─► v1 (jonli): sentence-transformers (all-MiniLM-L6-v2)
+    │    │   Output: 384-dimensional embedding (max 512 tokens, ~0.5ms per chunk on GPU)
+    │    └─► v2 (bge-m3 1024-d, branch): Ollama (bge-m3)
+    │        Output: 1024-dimensional embedding (max 8192 tokens)
     │
     ├─► [Normalization]
-    │    └─► L2 normalization for cosine similarity
+    │    └─► L2 normalization for cosine similarity (v1) / raw embeddings with L2 space (v2)
     │
     └─► [Vector DB Storage]
-        └─► Chroma DuckDB backend
+        └─► Chroma backend (DuckDB in v1 / SQLite + Rust in v2 Chroma 1.5.9)
             - Persistent storage
             - HNSW indexing (approximate nearest neighbors)
             - Ready for semantic search
@@ -246,7 +250,7 @@ from claude_kg import ClaudeKnowledgeGraph
 
 kg = ClaudeKnowledgeGraph(
     db_path: str = "./kg_db",           # Where to store vector DB
-    model_name: str = "all-MiniLM-L6-v2" # Embedding model
+    model_name: str = "all-MiniLM-L6-v2" # Embedding model (v1 (jonli) default; v2 uses Ollama bge-m3 via identity)
 )
 ```
 
@@ -256,10 +260,11 @@ kg = ClaudeKnowledgeGraph(
   - Can be absolute: `/home/user/.kg_db`
   - Will be created if doesn't exist
 
-- `model_name`: Hugging Face model for embeddings
-  - `all-MiniLM-L6-v2`: Fast (83MB), 384-dim (DEFAULT)
+- `model_name`: Model identifier for embeddings
+  - `all-MiniLM-L6-v2`: Fast (83MB), 384-dim (DEFAULT in v1 (jonli))
   - `all-mpnet-base-v2`: Accurate (438MB), 768-dim
   - `distiluse-base-multilingual-cased-v2`: Multilingual
+  - Note for v2: v2 (bge-m3 1024-d, branch) uses Ollama `bge-m3` (1024-d) resolved automatically via database identity (`graphify_manifest.json`)
 
 **Environment:**
 - Requires: `ANTHROPIC_API_KEY` in `.env` or exported
@@ -474,20 +479,42 @@ SAVINGS: 74% less cost! 🎉
 |--------|-------|-------|
 | **Docs** | 1M+ | Chroma can handle millions |
 | **Query speed** | <10ms | Vector search is O(log n) |
-| **Memory** | ~1GB/100K docs | Embeddings: 384 dims × 4 bytes |
+| **Memory** | ~1GB/100K docs (v1) / ~2.5GB/100K docs (v2) | Embeddings: v1 (jonli) 384 dims × 4 bytes; v2 (bge-m3 1024-d, branch) 1024 dims × 4 bytes |
 | **Storage** | ~500MB/100K docs | DuckDB optimized |
 
-### 5.4 Accuracy Metrics
+### 5.4 Similarity Calculation & Distance Conversion
+
+In `similarity.py`, distance is converted to similarity in `[0.0, 1.0]` based on the collection's metric space:
+
+1. **Cosine / Inner Product Space (`hnsw:space = "cosine"` or `"ip"`)**:
+   Used in v1 (jonli) with normalized vectors:
+   $$\text{sim} = 1.0 - d$$
+   where $d \in [0, 2]$ is the cosine distance returned by Chroma.
+
+2. **L2 Space (`hnsw:space = "l2"`)**:
+   Used in v2 (bge-m3 1024-d, branch) builds (`kg_db_v2b`). Chroma returns squared Euclidean distance $d = \|u - v\|^2$.
+   - **For unit-length vectors ($\|u\| = \|v\| = 1$)**:
+     $$d = \|u - v\|^2 = \|u\|^2 + \|v\|^2 - 2(u \cdot v) = 2(1 - \cos\theta)$$
+     $$\implies \text{sim} = \cos\theta = 1.0 - \frac{d}{2.0}$$
+   - **For unnormalized vectors**:
+     `1 - d/2` is mathematically valid only for unit-length vectors. If non-unit vectors are detected, the system falls back to calculating the normalized dot product directly:
+     $$\text{sim} = \frac{u \cdot v}{\|u\| \|v\|}$$
+
+3. **Clamping**:
+   $$\text{clamped\_sim} = \max(0.0, \min(1.0, \text{sim}))$$
+
+4. **Relevance Threshold & Filtering**:
+   `MIN_SIMILARITY = 0.10` (`GRAPHIFY_MIN_SIMILARITY`) acts as a preliminary noise filter. Hybrid ranking (RRF: dense weight 1.0, lexical weight 0.2) and lexical gate (`MIN_COVERAGE = 0.5`) provide precise retrieval.
 
 ```
-Relevance Score: 0-1 (cosine similarity)
+Relevance Score: 0-1 (similarity)
 
 Score | Relevance | Usage
 0.90+ | Perfect match | Use directly
 0.80+ | Very relevant | Use with confidence
 0.70+ | Relevant | Use with context
 0.60+ | Somewhat relevant | Consider including
-<0.60 | Not relevant | Ignore
+<0.60 | Not relevant | Low relevance
 ```
 
 ---
@@ -603,7 +630,7 @@ MemoryError: Unable to allocate 2.5 GiB for an array
 ```python
 # Use smaller model
 kg = ClaudeKnowledgeGraph(
-    model_name="all-MiniLM-L6-v2"  # 83MB (not 438MB)
+    model_name="all-MiniLM-L6-v2"  # v1 (jonli): 83MB, 384-dim (in v2 (bge-m3 1024-d, branch): Ollama bge-m3 1024-dim)
 )
 
 # Or reduce batch size
@@ -688,7 +715,7 @@ kg.retrieve(query, top_k=5)    # Balanced
 kg.retrieve(query, top_k=10)   # Comprehensive
 
 # Embedding model
-"all-MiniLM-L6-v2"      # Default: fast
+"all-MiniLM-L6-v2"      # v1 (jonli) default: fast, 384-dim (v2 (bge-m3 1024-d, branch): Ollama bge-m3, 1024-dim)
 "all-mpnet-base-v2"     # Better: accurate
 "thenlper/gte-small"    # Advanced: specialized
 
@@ -710,12 +737,12 @@ kg.retrieve(query, top_k=10)   # Comprehensive
 - ✅ Python-native
 - ✅ No deployment needed
 
-### Why sentence-transformers?
+### Why sentence-transformers / embedding models?
 
 - ✅ Runs locally (0 API cost)
-- ✅ 384 dimensions (balanced size)
+- ✅ Balanced dimensions: v1 (jonli) uses 384 dimensions (`all-MiniLM-L6-v2`); v2 (bge-m3 1024-d, branch) uses 1024 dimensions (`bge-m3` via Ollama for superior multilingual performance)
 - ✅ Trained on semantic similarity
-- ✅ Fast inference (~0.5ms)
+- ✅ Fast inference (~0.5ms on GPU)
 
 ### Why Anthropic Claude?
 
