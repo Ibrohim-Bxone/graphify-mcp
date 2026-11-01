@@ -662,6 +662,7 @@ def write_manifest_and_identity(
     distance: str,
     corpus_hash: str,
     kw_gen: str,
+    normalization: bool = False,
 ) -> dict:
     """Write manifest.jsonl and graphify_manifest.json with complete model identity."""
     manifest_path = out_dir / "manifest.jsonl"
@@ -682,7 +683,7 @@ def write_manifest_and_identity(
         "model_digest": model_digest,
         "dimension": EXPECTED_DIMENSION,
         "distance": distance,
-        "normalization": False,
+        "normalization": bool(normalization),
         "corpus_hash": corpus_hash,
         "keyword_index_generation": kw_gen,
         "total_records": len(records),
@@ -756,6 +757,38 @@ def _validate_completion_marker_identity(marker_data: dict, current_identity: di
     return True
 
 
+def _align_chroma_collection_configuration(db_path: Path, collection_name: str = "graphify") -> None:
+    """Aligns Chroma collection embedding configuration with identity to prevent Chroma 1.5.9 conflict with 'default'."""
+    sqlite_file = db_path / "chroma.sqlite3"
+    if not sqlite_file.exists():
+        return
+    try:
+        conn = sqlite3.connect(str(sqlite_file), timeout=10.0)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id, schema_str FROM collections WHERE name = ?", (collection_name,))
+            row = cur.fetchone()
+            if row and row[1] and '"name":"default"' in row[1].replace(" ", ""):
+                cid, s_str = row
+                s_obj = json.loads(s_str)
+                def fix_ef(obj):
+                    if isinstance(obj, dict):
+                        if obj.get("embedding_function") == {"type": "known", "name": "default", "config": {}}:
+                            obj["embedding_function"] = {"type": "legacy"}
+                        for v in obj.values():
+                            fix_ef(v)
+                    elif isinstance(obj, list):
+                        for v in obj:
+                            fix_ef(v)
+                fix_ef(s_obj)
+                cur.execute("UPDATE collections SET schema_str = ? WHERE id = ?", (json.dumps(s_obj), cid))
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
 def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int = 8) -> None:
     """Compare destination document+metadata hashes, re-embed/upsert changed ids, delete removed ids.
 
@@ -777,6 +810,46 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         BGE_M3_CONFIG["config"]["ollama"]["model"],
     )
 
+    dest_manifest_file = out_dir / "graphify_manifest.json"
+    dest_norm = False
+    dest_dist = col_meta.get("hnsw:space", "l2")
+    if dest_manifest_file.exists():
+        try:
+            with open(dest_manifest_file, "r", encoding="utf-8") as f:
+                dest_m = json.load(f)
+            if isinstance(dest_m, dict):
+                from identity_utils import _parse_bool
+                if "normalization" in dest_m:
+                    dest_norm = _parse_bool(dest_m["normalization"])
+                elif "graphify:normalization" in dest_m:
+                    dest_norm = _parse_bool(dest_m["graphify:normalization"])
+                if "distance" in dest_m:
+                    dest_dist = dest_m["distance"]
+                elif "graphify:distance" in dest_m:
+                    dest_dist = dest_m["graphify:distance"]
+        except Exception:
+            pass
+    elif (out_dir / "chroma.sqlite3").exists():
+        try:
+            conn = sqlite3.connect(f"file:{(out_dir / 'chroma.sqlite3').as_posix()}?mode=ro", uri=True, timeout=5.0)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM collections WHERE name = ?", (col_name,))
+                c_row = cur.fetchone()
+                if c_row:
+                    cur.execute("SELECT key, bool_value, str_value FROM collection_metadata WHERE collection_id = ?", (c_row[0],))
+                    for k, b, s in cur.fetchall():
+                        if k in ("normalization", "graphify:normalization"):
+                            from identity_utils import _parse_bool
+                            val = bool(b) if b is not None else s
+                            dest_norm = _parse_bool(val)
+                        elif k in ("distance", "graphify:distance"):
+                            dest_dist = s
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
     # Strictly validate model identity before ANY mutation (read-only SQLite mode=ro first)
     validate_destination_persisted_identity(
         out_dir=out_dir,
@@ -785,7 +858,8 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         expected_digest=model_digest,
         expected_dimension=EXPECTED_DIMENSION,
         client=None,
-        expected_distance=col_meta.get("hnsw:space", "l2"),
+        expected_distance=dest_dist,
+        expected_normalization=dest_norm,
     )
 
     # Invalidate completion status before the first destination mutation (Finding 3 & TOPILMA 5)
@@ -805,7 +879,7 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
 
     client = chromadb.PersistentClient(path=str(out_dir))
 
-    space = col_meta.get("hnsw:space", "l2")
+    space = dest_dist
     sync_identity = {
         "schema_version": 2,
         "backend": "ollama",
@@ -813,14 +887,26 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         "model_digest": model_digest,
         "dimension": EXPECTED_DIMENSION,
         "distance": space,
-        "normalization": False,
+        "normalization": dest_norm,
     }
     embed_fn = build_chroma_embedding_function(identity=sync_identity)
-    col = client.get_or_create_collection(
-        name=col_name,
-        metadata={"hnsw:space": space, **sync_identity},
-        embedding_function=embed_fn,
-    )
+    _align_chroma_collection_configuration(out_dir, col_name)
+    try:
+        col = client.get_or_create_collection(
+            name=col_name,
+            metadata={"hnsw:space": space, **sync_identity},
+            embedding_function=embed_fn,
+        )
+    except ValueError as e:
+        if "Embedding function conflict" in str(e):
+            _align_chroma_collection_configuration(out_dir, col_name)
+            col = client.get_or_create_collection(
+                name=col_name,
+                metadata={"hnsw:space": space, **sync_identity},
+                embedding_function=embed_fn,
+            )
+        else:
+            raise
     # Persist identity metadata before any upsert (Finding 1 & TOPILMA 2)
     sync_modify_meta = {
         k: v for k, v in {
@@ -910,7 +996,11 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         col.delete(ids=to_delete)
 
     if to_upsert:
-        embedder = build_embedder(BGE_M3_CONFIG)
+        embed_cfg = json.loads(json.dumps(BGE_M3_CONFIG))
+        if dest_norm:
+            embed_cfg["config"]["ollama"]["normalize"] = True
+            embed_cfg["normalization"] = True
+        embedder = build_embedder(embed_cfg)
         print(f"[sync] {len(to_upsert)} ta yozuv bge-m3 bilan embed qilinmoqda...", flush=True)
         for i in range(0, len(to_upsert), batch_size):
             chunk = to_upsert[i : i + batch_size]
@@ -944,6 +1034,7 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
         distance=space,
         corpus_hash=corpus_hash,
         kw_gen=kw_gen,
+        normalization=dest_norm,
     )
 
     # Update collection metadata in ChromaDB (Finding 5)
@@ -954,17 +1045,244 @@ def run_sync(v1_dir: Path, out_dir: Path, batch_size: int = 50, max_workers: int
     print("[sync] Sinxronizatsiya muvaffaqiyatli yakunlandi.", flush=True)
 
 
+def _close_chroma_client(client) -> None:
+    """Safely close PersistentClient to release SQLite locks and resources."""
+    if client is None:
+        return
+    try:
+        if hasattr(client, "close") and callable(client.close):
+            client.close()
+        elif hasattr(client, "_system") and hasattr(client._system, "stop"):
+            client._system.stop()
+    except Exception:
+        pass
+
+
+def run_renormalize(src_dir: Path, out_dir: Path, batch_size: int = 500) -> None:
+    """Read v2 collection, normalize embeddings via L2, and write to a new database.
+
+    - Source database is strictly read-only; no files in src_dir are modified.
+    - Output path cannot equal source path or be a non-empty existing directory.
+    - Destination collection is created with hnsw:space=cosine and normalization=True.
+    - Verification checks: count match, 50 random samples vector = src/norm (1e-5),
+      manifests, keyword index rebuilt via subprocess, build_complete.json written at the end.
+    - Ollama is NEVER called.
+    """
+    src_dir = Path(src_dir)
+    out_dir = Path(out_dir)
+
+    if not src_dir.exists():
+        raise FileNotFoundError(f"Manba v2 baza topilmadi: {src_dir}")
+    if not (src_dir / "chroma.sqlite3").exists():
+        raise FileNotFoundError(f"Manba v2 SQLite fayli topilmadi: {src_dir / 'chroma.sqlite3'}")
+
+    if out_dir.resolve() == src_dir.resolve():
+        raise ValueError(f"Chiqish yo'li manba bilan bir xil bo'lishi mumkin emas: {out_dir}")
+    if out_dir.exists():
+        try:
+            if any(out_dir.iterdir()):
+                raise ValueError(f"Chiqish papkasi mavjud va bo'sh emas (ustidan yozish taqiqlangan): {out_dir}")
+        except FileNotFoundError:
+            pass
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now(timezone.utc)
+    print(f"[renormalize] Boshlanmoqda: src={src_dir}, out={out_dir}, batch_size={batch_size}...", flush=True)
+
+    src_client = None
+    out_client = None
+    temp_src_dir = None
+    try:
+        # Read source identity from manifest or collection
+        src_manifest_file = src_dir / "graphify_manifest.json"
+        src_identity = {}
+        if src_manifest_file.exists():
+            try:
+                with open(src_manifest_file, "r", encoding="utf-8") as f:
+                    src_identity = json.load(f)
+            except Exception:
+                src_identity = {}
+
+        import shutil
+        import tempfile
+        temp_src_dir = Path(tempfile.mkdtemp(prefix="graphify_renormalize_src_"))
+        shutil.copytree(src_dir, temp_src_dir, dirs_exist_ok=True)
+
+        import chromadb
+        src_client = chromadb.PersistentClient(path=str(temp_src_dir))
+        try:
+            src_col = src_client.get_collection("graphify")
+        except Exception as e:
+            raise RuntimeError(f"Manba kolleksiyasini ochib bo'lmadi ({src_dir}): {e}") from e
+
+        if not src_identity and src_col.metadata:
+            src_identity = dict(src_col.metadata)
+
+        total_records = src_col.count()
+        if total_records == 0:
+            raise RuntimeError(f"Manba kolleksiyasida yozuvlar topilmadi: {src_dir}")
+
+        # Prepare destination collection
+        out_identity = dict(src_identity)
+        out_identity.update({
+            "backend": src_identity.get("backend", "ollama"),
+            "model": src_identity.get("model", "bge-m3"),
+            "model_digest": src_identity.get("model_digest", ""),
+            "dimension": int(src_identity.get("dimension", EXPECTED_DIMENSION)),
+            "schema_version": int(src_identity.get("schema_version", 2)),
+            "distance": "cosine",
+            "normalization": True,
+        })
+
+        out_client = chromadb.PersistentClient(path=str(out_dir))
+        out_meta = {k: v for k, v in out_identity.items() if not k.startswith("hnsw:")}
+        out_meta["hnsw:space"] = "cosine"
+
+        out_col = out_client.get_or_create_collection(
+            name="graphify",
+            metadata=out_meta,
+        )
+        col_modify_meta = {k: v for k, v in out_meta.items() if not k.startswith("hnsw:")}
+        out_col.modify(metadata=col_modify_meta)
+        _align_chroma_collection_configuration(out_dir, "graphify")
+
+        import numpy as np
+        all_records = []
+
+        # Read and normalize in batches (Ollama is NEVER called)
+        for offset in range(0, total_records, batch_size):
+            chunk = src_col.get(
+                limit=batch_size,
+                offset=offset,
+                include=["documents", "metadatas", "embeddings"],
+            )
+            c_ids = chunk["ids"]
+            c_docs = chunk["documents"]
+            c_metas = chunk["metadatas"]
+            c_embs = chunk["embeddings"]
+
+            if not c_ids:
+                continue
+
+            arr = np.array(c_embs, dtype=np.float32)
+            norms = np.linalg.norm(arr, axis=1, keepdims=True)
+            if np.any(norms == 0.0) or np.any(np.isnan(norms)) or np.any(np.isinf(norms)):
+                raise ModelIdentityError("Nol vektor normallashtirib bo'lmaydi")
+            normed = (arr / norms).tolist()
+
+            out_col.add(
+                ids=c_ids,
+                documents=c_docs,
+                metadatas=c_metas,
+                embeddings=normed,
+            )
+
+            for rid, doc, meta in zip(c_ids, c_docs, c_metas):
+                all_records.append({
+                    "id": rid,
+                    "document": doc if doc is not None else "",
+                    "metadata": meta if meta is not None else {},
+                })
+            print(f"[renormalize] {min(offset + batch_size, total_records)}/{total_records} normallashtirildi...", flush=True)
+
+        # 1. Total records check
+        out_count = out_col.count()
+        if out_count != total_records:
+            raise AssertionError(f"Yozuvlar soni teng emas: chiqish={out_count}, manba={total_records}")
+
+        # 2. Check 50 random records: output vector == src / norm (1e-5 precision)
+        import random
+        sample_k = min(50, total_records)
+        all_ids = [r["id"] for r in all_records]
+        sample_ids = random.sample(all_ids, sample_k) if total_records >= sample_k else list(all_ids)
+
+        src_sample = src_col.get(ids=sample_ids, include=["embeddings"])
+        out_sample = out_col.get(ids=sample_ids, include=["embeddings"])
+
+        src_emb_map = dict(zip(src_sample["ids"], src_sample["embeddings"]))
+        out_emb_map = dict(zip(out_sample["ids"], out_sample["embeddings"]))
+
+        for sid in sample_ids:
+            s_vec = np.array(src_emb_map[sid], dtype=np.float32)
+            o_vec = np.array(out_emb_map[sid], dtype=np.float32)
+            s_norm = float(np.linalg.norm(s_vec))
+            if s_norm == 0.0 or np.isnan(s_norm):
+                raise ModelIdentityError(f"Manbada nol vektor ({sid})")
+            expected_vec = s_vec / s_norm
+            if not np.allclose(o_vec, expected_vec, atol=1e-5, rtol=1e-5):
+                raise AssertionError(f"Vektor normallashtirish mos kelmadi ({sid})")
+            o_norm = float(np.linalg.norm(o_vec))
+            if abs(o_norm - 1.0) > 1e-3:
+                raise AssertionError(f"Chiqish vektori normasi 1.0 emas: {o_norm} ({sid})")
+
+        # Clean up src_client references early
+        _close_chroma_client(src_client)
+        src_client = None
+
+        # Align chroma collection configuration so embedding_function is legacy
+        _align_chroma_collection_configuration(out_dir, "graphify")
+
+        # 3. Subprocess rebuild keyword index
+        rebuild_keyword_index_subprocess(out_dir)
+
+        # 4. Verify all records and keyword index content
+        verify_v2(out_col, all_records, out_dir)
+
+        # 5. Write manifest and graphify_manifest.json with normalization: True
+        kw_sqlite = out_dir / "keyword_index.sqlite3"
+        kw_gen = str(int(kw_sqlite.stat().st_mtime)) if kw_sqlite.exists() else "gen1"
+        corpus_hash = compute_corpus_hash(all_records)
+        v1_mtime = src_identity.get("v1_sqlite_mtime", 0.0)
+
+        final_identity = write_manifest_and_identity(
+            out_dir=out_dir,
+            records=all_records,
+            v1_mtime=v1_mtime,
+            started_at=started_at,
+            model_digest=out_identity.get("model_digest", ""),
+            distance="cosine",
+            corpus_hash=corpus_hash,
+            kw_gen=kw_gen,
+            normalization=True,
+        )
+        col_modify_meta = {k: v for k, v in final_identity.items() if not k.startswith("hnsw:")}
+        out_col.modify(metadata=col_modify_meta)
+
+        # 6. Write build_complete.json at the very end
+        write_build_complete_atomic(out_dir, final_identity, started_at)
+        print(f"[renormalize] Muvaffaqiyatli yakunlandi: {total_records} ta yozuv normallashtirildi va {out_dir} ga yozildi.", flush=True)
+    finally:
+        _close_chroma_client(src_client)
+        _close_chroma_client(out_client)
+        if temp_src_dir and Path(temp_src_dir).exists():
+            import shutil
+            shutil.rmtree(temp_src_dir, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build or sync Graphify v2 database")
     parser.add_argument("--v1-db", default="kg_db", help="Path to source v1 database (default: kg_db)")
     parser.add_argument("--out", default=None, help="Output directory for v2 database")
     parser.add_argument("--smoke", action="store_true", help="Smoke run: first 300 records into kg_db_v2_smoke/")
     parser.add_argument("--sync", action="store_true", help="Sync incremental changes from v1")
+    parser.add_argument("--renormalize", action="store_true", help="Renormalize existing v2 database embeddings into new database")
+    parser.add_argument("--src", default=None, help="Source v2 database path for --renormalize")
     parser.add_argument("--batch-size", type=int, default=50, help="Batch size for embedding and DB writes")
     parser.add_argument("--max-workers", type=int, default=8, help="Worker threads for parallel Ollama calls")
     args = parser.parse_args()
 
     v1_dir = Path(args.v1_db)
+    if args.renormalize:
+        if not args.src:
+            raise ValueError("--renormalize rejimi uchun --src <v2 baza> ko'rsatilishi shart")
+        if not args.out:
+            raise ValueError("--renormalize rejimi uchun --out ko'rsatilishi shart")
+        src_path = Path(args.src)
+        out_path = Path(args.out)
+        batch_size = args.batch_size if args.batch_size != 50 else 500
+        run_renormalize(src_path, out_path, batch_size=batch_size)
+        return
+
     if args.out:
         out_dir = Path(args.out)
     elif args.smoke:

@@ -233,6 +233,17 @@ def _open_collection(client):
     """
     identity = get_db_identity(client=client)
     if identity:
+        raw_norm = identity.get("normalization")
+        if raw_norm is None:
+            raw_norm = identity.get("graphify:normalization")
+        if raw_norm is None:
+            raise ModelIdentityError("Baza identity'sida 'normalization' ko'rsatilmagan")
+        try:
+            norm_bool = _parse_bool(raw_norm)
+        except Exception as e:
+            raise ModelIdentityError(f"Baza identity'sida 'normalization' boolean emas: {raw_norm}") from e
+        identity["normalization"] = norm_bool
+
         if STORAGE_MODE == "local":
             _align_chroma_collection_configuration(Path(DB_PATH), COLLECTION)
         embed_fn = build_chroma_embedding_function(identity=identity)

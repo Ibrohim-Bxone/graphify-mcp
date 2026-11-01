@@ -599,6 +599,125 @@ def check_v2_completeness(v2_dir: Path) -> dict:
     }
 
 
+def check_v2_normalization(v2_dir: Path) -> dict:
+    """Verify v2 database embedding normalization in a temporary copy following existing style.
+
+    - If normalization: True, verifies a sample of up to 20 vectors has L2 norm == 1.0 (within 1e-3).
+      If norm violates 1±1e-3, returns FAIL.
+    - If normalization: False, returns WARN ("vektorlar normallashtirilmagan — reyting normaga og'adi").
+    """
+    manifest_file = v2_dir / "graphify_manifest.json"
+    norm_val = None
+    if manifest_file.exists():
+        try:
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                m_data = json.load(f)
+            if isinstance(m_data, dict):
+                norm_val = m_data.get("normalization")
+                if norm_val is None:
+                    norm_val = m_data.get("graphify:normalization")
+        except Exception as e:
+            return {"status": "FAIL", "error": f"graphify_manifest.json o'qishda xatolik: {e}"}
+
+    db_file = v2_dir / "chroma.sqlite3"
+    if not db_file.exists():
+        return {"status": "FAIL", "error": f"Chroma DB fayli topilmadi: {db_file}"}
+
+    if norm_val is None:
+        try:
+            conn = sqlite3.connect(f"file:{db_file.as_posix()}?mode=ro", uri=True, timeout=5.0)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM collections WHERE name = 'graphify'")
+                c_row = cur.fetchone()
+                if c_row:
+                    cur.execute(
+                        "SELECT key, bool_value, str_value, int_value FROM collection_metadata WHERE collection_id = ?",
+                        (c_row[0],),
+                    )
+                    for k, b, s, i in cur.fetchall():
+                        if k in ("normalization", "graphify:normalization"):
+                            norm_val = bool(b) if b is not None else s if s is not None else bool(i)
+                            break
+            finally:
+                conn.close()
+        except Exception as e:
+            return {"status": "FAIL", "error": f"Baza metadata o'qishda xatolik: {e}"}
+
+    if norm_val is None:
+        return {"status": "FAIL", "error": "Baza identity'sida 'normalization' topilmadi"}
+
+    from identity_utils import _parse_bool
+    try:
+        norm_bool = _parse_bool(norm_val)
+    except Exception as e:
+        return {"status": "FAIL", "error": f"Baza identity'sida 'normalization' noto'g'ri: {e}"}
+
+    if not norm_bool:
+        return {
+            "status": "WARN",
+            "message": "vektorlar normallashtirilmagan — reyting normaga og'adi",
+        }
+
+    # normalization: True -> check sample of up to 20 records in tmp copy
+    import tempfile
+    import shutil
+    import gc
+    import chromadb
+    import numpy as np
+
+    client = None
+    col = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="graphify-v2-norm-", ignore_cleanup_errors=True) as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            sqlite_src = v2_dir / "chroma.sqlite3"
+            if sqlite_src.exists():
+                shutil.copy2(sqlite_src, tmp_path / "chroma.sqlite3")
+                for extra in ("chroma.sqlite3-wal", "chroma.sqlite3-shm"):
+                    if (v2_dir / extra).exists():
+                        shutil.copy2(v2_dir / extra, tmp_path / extra)
+            for item in v2_dir.iterdir():
+                if item.is_dir() and not item.name.startswith("."):
+                    shutil.copytree(item, tmp_path / item.name, dirs_exist_ok=True)
+
+            try:
+                client = chromadb.PersistentClient(path=str(tmp_path))
+                col = client.get_collection("graphify")
+                cnt = col.count()
+                if cnt == 0:
+                    return {"status": "FAIL", "error": "Kolleksiya bo'sh (yozuvlar yo'q)"}
+                sample_limit = min(20, cnt)
+                res = col.get(limit=sample_limit, include=["embeddings"])
+                embs = res.get("embeddings")
+                if embs is None or len(embs) == 0:
+                    return {"status": "FAIL", "error": "Embeddinglar topilmadi"}
+
+                for idx, vec in enumerate(embs):
+                    if vec is None or len(vec) == 0:
+                        return {"status": "FAIL", "error": f"Yozuv {idx} da embedding yo'q"}
+                    v = np.array(vec, dtype=np.float32)
+                    norm = float(np.linalg.norm(v))
+                    if abs(norm - 1.0) > 1e-3:
+                        return {
+                            "status": "FAIL",
+                            "error": f"Namunaviy yozuv normasi 1±1e-3 oralig'ida emas: norm={norm:.6f} (kutilgan=1.0)",
+                        }
+                return {"status": "PASS", "sample_count": len(embs)}
+            finally:
+                try:
+                    if client is not None:
+                        if hasattr(client, "close") and callable(client.close):
+                            client.close()
+                        elif hasattr(client, "_system") and hasattr(client._system, "stop"):
+                            client._system.stop()
+                finally:
+                    del client, col
+                    gc.collect()
+    except Exception as e:
+        return {"status": "FAIL", "error": f"Namunaviy vektorlarni tekshirishda xatolik: {e}"}
+
+
 def print_checklist(
     processes: list[dict] | None,
     drift: dict,
@@ -607,13 +726,17 @@ def print_checklist(
     v1_dir: Path,
     v2_dir: Path,
     completeness: dict | None = None,
+    normalization: dict | None = None,
 ) -> bool:
     """Print formatted pre-switch checklist and ordered execution steps.
 
     Returns True if system is ready to switch, False otherwise.
     """
-    if completeness is None and v2_dir is not None:
+    if completeness is None and v2_dir is not None and (v2_dir / "graphify_manifest.json").exists():
         completeness = check_v2_completeness(v2_dir)
+
+    if normalization is None and v2_dir is not None and (v2_dir / "graphify_manifest.json").exists():
+        normalization = check_v2_normalization(v2_dir)
 
     print("=" * 70)
     print("[CHECKLIST] GRAPHIFY v2 O'TISH OLDIDAN TEKSHIRUV (SWITCH CHECKLIST)")
@@ -658,7 +781,7 @@ def print_checklist(
     else:
         print(f"   [FAIL] Drift tekshiruvi: {drift.get('message')}")
 
-    # 3. Model Identity & Completeness
+    # 3. Model Identity, Completeness & Normalization
     print("\n3. v2 MODEL IDENTIFIKATSIYASI VA BAZA TO'LIQLIGI (SELF-TEST):")
     if identity.get("status") == "PASS":
         print("   [PASS] Self-test: PASS")
@@ -675,6 +798,15 @@ def print_checklist(
             print(f"   [PASS] Baza to'liqligi: PASS ({completeness.get('count', 0)} ta yozuv)")
         else:
             print(f"   [FAIL] Baza to'liqligi: FAIL ({completeness.get('error')})")
+
+    if normalization is not None:
+        if normalization.get("status") == "PASS":
+            print(f"   [PASS] Vektorlar normalizatsiyasi: PASS ({normalization.get('sample_count', 20)} ta namunaviy vektor normasi 1±1e-3)")
+        elif normalization.get("status") == "WARN":
+            warn_msg = normalization.get("message") or "vektorlar normallashtirilmagan — reyting normaga og'adi"
+            print(f"   [WARN] {warn_msg}")
+        else:
+            print(f"   [FAIL] Vektorlar normalizatsiyasi: FAIL ({normalization.get('error')})")
 
     # 4. Launch Configs
     print("\n4. SOZLAMA FAYLLARI (Faqat kalit nomi tekshirildi, qiymatlar yashirin):")
@@ -711,6 +843,7 @@ def print_checklist(
         and drift.get("total_drift", 0) == 0
         and identity.get("status") == "PASS"
         and (completeness is None or completeness.get("status") == "PASS")
+        and (normalization is None or normalization.get("status") in ("PASS", "WARN"))
     )
 
     print("=" * 70)
@@ -736,9 +869,13 @@ def main():
     drift = check_v1_manifest_drift(v1_dir, v2_dir)
     identity = check_v2_identity(v2_dir)
     completeness = check_v2_completeness(v2_dir)
+    normalization = check_v2_normalization(v2_dir)
     launch_configs = inspect_launch_configs()
 
-    is_ready = print_checklist(processes, drift, identity, launch_configs, v1_dir, v2_dir, completeness=completeness)
+    is_ready = print_checklist(
+        processes, drift, identity, launch_configs, v1_dir, v2_dir,
+        completeness=completeness, normalization=normalization
+    )
     if not is_ready:
         sys.exit(1)
 

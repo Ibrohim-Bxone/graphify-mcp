@@ -282,16 +282,38 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
         return "Knowledge base is empty. Nothing indexed yet."
     import search_service
     import keyword_index
+    import search_core
     kw_idx = keyword_index.get_index()
-    
-    res = search_service.retrieve(
-        query=query,
-        top_k=top_k,
-        where=where,
-        collection=_col,
-        kw_index=kw_idx,
-        min_similarity=MIN_SIMILARITY
-    )
+
+    captured_degraded = []
+    captured_errors = []
+    orig_hybrid = getattr(search_core, "hybrid_search", None)
+
+    def _tracking_hybrid(*args, **kwargs):
+        h_res = orig_hybrid(*args, **kwargs)
+        if isinstance(h_res, dict) and h_res.get("degraded"):
+            captured_degraded.append(h_res["degraded"])
+            if h_res.get("degraded_error"):
+                captured_errors.append(h_res["degraded_error"])
+        return h_res
+
+    try:
+        if orig_hybrid is not None:
+            search_core.hybrid_search = _tracking_hybrid
+        res = search_service.retrieve(
+            query=query,
+            top_k=top_k,
+            where=where,
+            collection=_col,
+            kw_index=kw_idx,
+            min_similarity=MIN_SIMILARITY
+        )
+    finally:
+        if orig_hybrid is not None:
+            search_core.hybrid_search = orig_hybrid
+
+    is_degraded = res.get("degraded") or (captured_degraded[0] if captured_degraded else None)
+    degraded_err = res.get("degraded_error") or (captured_errors[0] if captured_errors else "")
     
     out = []
     if res["status"] == "insufficient_evidence":
@@ -342,9 +364,14 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
             _record_search_savings(where, returned_tokens)
     except Exception as err:
         print(f"[graphify] Statistika xatosi ({err}), o'tkazib yuborildi.", file=sys.stderr)
-    if not out:
-        return "No relevant results found."
-    return "\n\n---\n\n".join(out)
+    result_text = "\n\n---\n\n".join(out) if out else "No relevant results found."
+    if is_degraded:
+        err_short = str(degraded_err).strip().splitlines()[0] if degraded_err else "vektor indeksi xatosi"
+        if len(err_short) > 120:
+            err_short = err_short[:117] + "..."
+        warning_header = f"⚠️ Vektor qidiruv ishlamadi ({err_short}), natija faqat kalit so'z bo'yicha."
+        return f"{warning_header}\n\n{result_text}"
+    return result_text
 
 
 @mcp.tool()

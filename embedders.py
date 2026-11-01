@@ -83,6 +83,11 @@ def save_models_config(cfg: dict) -> None:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
 
+class ModelIdentityError(Exception):
+    """Raised when database model identity validation fails (fails closed, no fallback)."""
+    pass
+
+
 class EmbedderBase(ABC):
     """Common interface for every embedding backend (see CUSTOM_MODELS.md)."""
 
@@ -126,13 +131,15 @@ class OllamaEmbedder(EmbedderBase):
     """Local Ollama server. Requires `requests` + Ollama running with an
     embedding-capable model already pulled (e.g. `ollama pull nomic-embed-text`)."""
 
-    def __init__(self, base_url: str = "http://localhost:11434", model: str = "nomic-embed-text"):
+    def __init__(self, base_url: str = "http://localhost:11434", model: str = "nomic-embed-text", normalize: bool = False):
         try:
             import requests  # noqa: F401
         except ImportError as e:
             raise RuntimeError("`requests` paketi o'rnatilmagan: pip install requests") from e
         self._base_url = (base_url or "http://localhost:11434").rstrip("/")
         self._model = model or "nomic-embed-text"
+        self._normalize = bool(normalize)
+        self.normalize = self._normalize
 
     def encode(self, texts):
         import requests
@@ -145,7 +152,19 @@ class OllamaEmbedder(EmbedderBase):
             )
             r.raise_for_status()
             out.append(r.json()["embedding"])
-        return np.array(out)
+        arr = np.array(out, dtype=np.float32)
+        if self._normalize and arr.size > 0:
+            if arr.ndim == 1:
+                norm = float(np.linalg.norm(arr))
+                if norm == 0.0 or np.isnan(norm) or np.isinf(norm):
+                    raise ModelIdentityError("Nol vektor normallashtirib bo'lmaydi")
+                arr = arr / norm
+            elif arr.ndim == 2:
+                norms = np.linalg.norm(arr, axis=1, keepdims=True)
+                if np.any(norms == 0.0) or np.any(np.isnan(norms)) or np.any(np.isinf(norms)):
+                    raise ModelIdentityError("Nol vektor normallashtirib bo'lmaydi")
+                arr = arr / norms
+        return arr
 
 
 class CustomAPIEmbedder(EmbedderBase):
@@ -183,7 +202,8 @@ def build_embedder(cfg: dict = None) -> EmbedderBase:
     if kind == "openai":
         return OpenAIEmbedder(api_key=sub.get("api_key", ""), model=sub.get("model") or "text-embedding-3-small")
     if kind == "ollama":
-        return OllamaEmbedder(base_url=sub.get("base_url") or "http://localhost:11434", model=sub.get("model") or "nomic-embed-text")
+        norm = sub.get("normalize", False) or sub.get("normalization", False) or cfg.get("normalization", False)
+        return OllamaEmbedder(base_url=sub.get("base_url") or "http://localhost:11434", model=sub.get("model") or "nomic-embed-text", normalize=bool(norm))
     if kind == "custom":
         return CustomAPIEmbedder(base_url=sub.get("base_url", ""), api_key=sub.get("api_key", ""), model=sub.get("model", ""))
     return LocalEmbedder()
@@ -198,15 +218,34 @@ class _ChromaEmbeddingFunctionAdapter:
         self._backend_name = backend_name
 
     def __call__(self, input):
+        if isinstance(input, str):
+            input = [input]
         return self._embedder.encode(list(input)).tolist()
+
+    def embed_query(self, input):
+        return self(input)
+
+    def embed_documents(self, input):
+        return self(input)
 
     def name(self):
         return f"graphify-{self._backend_name}"
 
+    def default_space(self) -> str:
+        return "cosine"
 
-class ModelIdentityError(Exception):
-    """Raised when database model identity validation fails (fails closed, no fallback)."""
-    pass
+    def supported_spaces(self) -> list:
+        return ["cosine", "l2", "ip"]
+
+    def get_config(self) -> dict:
+        return {"backend_name": self._backend_name}
+
+    @staticmethod
+    def build_from_config(config: dict):
+        return NotImplemented
+
+    def is_legacy(self) -> bool:
+        return True
 
 
 def get_ollama_model_digest(base_url: str = "http://localhost:11434", model: str = "bge-m3") -> str:
@@ -265,6 +304,17 @@ def build_identity_embedder(identity: dict, base_url: str = None) -> EmbedderBas
     if expected_dim is None:
         raise ModelIdentityError("Identifikatsiyada model dimension ko'rsatilmagan")
 
+    raw_norm = identity.get("normalization")
+    if raw_norm is None:
+        raw_norm = identity.get("graphify:normalization")
+    normalize_flag = False
+    if raw_norm is not None:
+        from identity_utils import _parse_bool
+        try:
+            normalize_flag = _parse_bool(raw_norm)
+        except Exception as e:
+            raise ModelIdentityError(f"Identifikatsiyada normalization boolean emas: {raw_norm}") from e
+
     if backend == "ollama":
         if not expected_digest:
             raise ModelIdentityError("Identifikatsiyada model_digest ko'rsatilmagan")
@@ -275,7 +325,7 @@ def build_identity_embedder(identity: dict, base_url: str = None) -> EmbedderBas
                 f"Model digest mos kelmadi: kutilgan={expected_digest}, haqiqiy={actual_digest}"
             )
         try:
-            embedder = OllamaEmbedder(base_url=ollama_url, model=model)
+            embedder = OllamaEmbedder(base_url=ollama_url, model=model, normalize=normalize_flag)
         except Exception as e:
             raise ModelIdentityError(f"Ollama embedder yaratib bo'lmadi: {e}") from e
     elif backend == "local":
