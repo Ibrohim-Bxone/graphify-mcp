@@ -30,7 +30,7 @@ DEFAULT_CONFIG = {
     "embedder_type": "local",
     "config": {
         "openai": {"api_key": "", "model": "text-embedding-3-small"},
-        "ollama": {"base_url": "http://localhost:11434", "model": "nomic-embed-text"},
+        "ollama": {"base_url": "http://127.0.0.1:11434", "model": "nomic-embed-text"},
         "custom": {"base_url": "", "api_key": "", "model": ""},
     },
 }
@@ -131,12 +131,12 @@ class OllamaEmbedder(EmbedderBase):
     """Local Ollama server. Requires `requests` + Ollama running with an
     embedding-capable model already pulled (e.g. `ollama pull nomic-embed-text`)."""
 
-    def __init__(self, base_url: str = "http://localhost:11434", model: str = "nomic-embed-text", normalize: bool = False):
+    def __init__(self, base_url: str = "http://127.0.0.1:11434", model: str = "nomic-embed-text", normalize: bool = False):
         try:
             import requests  # noqa: F401
         except ImportError as e:
             raise RuntimeError("`requests` paketi o'rnatilmagan: pip install requests") from e
-        self._base_url = (base_url or "http://localhost:11434").rstrip("/")
+        self._base_url = (base_url or "http://127.0.0.1:11434").rstrip("/")
         self._model = model or "nomic-embed-text"
         self._normalize = bool(normalize)
         self.normalize = self._normalize
@@ -203,7 +203,7 @@ def build_embedder(cfg: dict = None) -> EmbedderBase:
         return OpenAIEmbedder(api_key=sub.get("api_key", ""), model=sub.get("model") or "text-embedding-3-small")
     if kind == "ollama":
         norm = sub.get("normalize", False) or sub.get("normalization", False) or cfg.get("normalization", False)
-        return OllamaEmbedder(base_url=sub.get("base_url") or "http://localhost:11434", model=sub.get("model") or "nomic-embed-text", normalize=bool(norm))
+        return OllamaEmbedder(base_url=sub.get("base_url") or "http://127.0.0.1:11434", model=sub.get("model") or "nomic-embed-text", normalize=bool(norm))
     if kind == "custom":
         return CustomAPIEmbedder(base_url=sub.get("base_url", ""), api_key=sub.get("api_key", ""), model=sub.get("model", ""))
     return LocalEmbedder()
@@ -248,11 +248,11 @@ class _ChromaEmbeddingFunctionAdapter:
         return True
 
 
-def get_ollama_model_digest(base_url: str = "http://localhost:11434", model: str = "bge-m3") -> str:
+def get_ollama_model_digest(base_url: str = "http://127.0.0.1:11434", model: str = "bge-m3") -> str:
     """Fetch model digest from Ollama /api/tags or /api/show."""
     import urllib.request
     
-    url_base = (base_url or "http://localhost:11434").rstrip("/")
+    url_base = (base_url or "http://127.0.0.1:11434").rstrip("/")
     target_tag = model if ":" in model else f"{model}:latest"
     try:
         req = urllib.request.Request(f"{url_base}/api/tags", headers={"User-Agent": "graphify"})
@@ -318,7 +318,7 @@ def build_identity_embedder(identity: dict, base_url: str = None) -> EmbedderBas
     if backend == "ollama":
         if not expected_digest:
             raise ModelIdentityError("Identifikatsiyada model_digest ko'rsatilmagan")
-        ollama_url = base_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        ollama_url = base_url or os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
         actual_digest = get_ollama_model_digest(ollama_url, model)
         if actual_digest != expected_digest:
             raise ModelIdentityError(

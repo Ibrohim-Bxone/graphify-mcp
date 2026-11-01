@@ -129,7 +129,7 @@ def run_worker(version: str, db_path: str, queries_file: str, worker_out: str) -
                 "embedder_type": "ollama",
                 "config": {
                     "ollama": {
-                        "base_url": os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+                        "base_url": os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
                         "model": "bge-m3",
                     }
                 },

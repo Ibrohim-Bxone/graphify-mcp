@@ -232,7 +232,7 @@ def index():
             )
         elif key == 'ollama':
             fields_html = (
-                f'<input type="text" name="ollama_base_url" placeholder="http://localhost:11434" value="{esc(sub.get("base_url", "http://localhost:11434"))}">'
+                f'<input type="text" name="ollama_base_url" placeholder="http://127.0.0.1:11434" value="{esc(sub.get("base_url", "http://127.0.0.1:11434"))}">'
                 f'<input type="text" name="ollama_model" placeholder="model (masalan nomic-embed-text)" value="{esc(sub.get("model", "nomic-embed-text"))}">'
             )
         elif key == 'custom':
