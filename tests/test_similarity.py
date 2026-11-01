@@ -119,3 +119,36 @@ def test_make_scorer_space_from_configuration_json():
     scorer = make_scorer(ConfiguredCollection())
     sim, raw = scorer(0.3)
     assert np.isclose(raw, 0.7)
+
+
+def test_check_unit_length_exception_fails_closed_and_does_not_cache(capsys):
+    """T5 regression: _check_unit_length returns False on exception, logs to stderr, and does not cache."""
+    import similarity
+    from similarity import _check_unit_length
+    similarity._unit_length_cache.clear()
+
+    class FailingCollection:
+        id = "failing_col_test"
+
+        def count(self):
+            return 10
+
+        def get(self, limit=5, include=None):
+            raise RuntimeError("Database read failed deliberately")
+
+    col = FailingCollection()
+    # 1. On exception, must return False (fail-closed)
+    res1 = _check_unit_length(col)
+    assert res1 is False
+
+    # 2. Cache must NOT store the result (cache remains empty)
+    assert len(similarity._unit_length_cache) == 0
+
+    # 3. Error must be logged to sys.stderr
+    captured = capsys.readouterr()
+    assert "Database read failed deliberately" in captured.err
+
+    # 4. Next call must re-attempt and not return a stale cached value
+    res2 = _check_unit_length(col)
+    assert res2 is False
+    assert len(similarity._unit_length_cache) == 0

@@ -92,10 +92,9 @@ def _check_unit_length(collection):
         if cache_key is not None:
             _unit_length_cache[cache_key] = True
         return True
-    except Exception:
-        if cache_key is not None:
-            _unit_length_cache[cache_key] = True
-        return True
+    except Exception as e:
+        print(f"[similarity] Embedding o'qishda xatolik: {e}", file=sys.stderr)
+        return False
 
 def distance_to_similarity(distance: float, space: str, *, query_vec=None, doc_vec=None) -> tuple[float, float]:
     """Masofani o'xshashlikka o'tkazadi.

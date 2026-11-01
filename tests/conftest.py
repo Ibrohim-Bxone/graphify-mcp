@@ -1,10 +1,29 @@
 import os
+import tempfile
+from pathlib import Path
 import pytest
 import reranker
+
+# Module-level isolation: test modules import db / keyword_index during collection.
+# Always overwrite GRAPHIFY_DB_PATH so external environment never pollutes tests.
+_TEST_DB_PATH = tempfile.mkdtemp(prefix="graphify-test-")
+os.environ["GRAPHIFY_DB_PATH"] = _TEST_DB_PATH
+
+# Track checkout kg_db presence before test collection starts
+_CHECKOUT_ROOT = Path(__file__).resolve().parents[1]
+_CHECKOUT_KG_DB = _CHECKOUT_ROOT / "kg_db"
+_INITIAL_KG_DB_EXISTS = _CHECKOUT_KG_DB.exists()
 
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "reranker: mark test as opting in to reranker / model loading")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if not _INITIAL_KG_DB_EXISTS:
+        assert not _CHECKOUT_KG_DB.exists(), (
+            f"Test to'plami tugagach checkout ichida kg_db/ yaratilgan bo'lmasligi kerak: {_CHECKOUT_KG_DB}"
+        )
 
 
 @pytest.fixture

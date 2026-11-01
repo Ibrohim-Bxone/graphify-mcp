@@ -177,6 +177,8 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
     
     # 1. Fetch 50 from Vector
     vec_candidates = []
+    vector_degraded = False
+    vector_degraded_error = None
     space = similarity.collection_space(collection)
     needs_embeddings = (space == "l2" and not similarity._check_unit_length(collection))
     
@@ -236,6 +238,8 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
         err_msg = str(e).lower()
         if any(s in err_msg for s in ["stale", "does not exist", "not found", "error finding id"]):
             raise
+        vector_degraded = True
+        vector_degraded_error = str(e)
         print(f"[hybrid_search] Vector search error: {e}", file=sys.stderr)
         
     # 2. Fetch 50 from Keyword
@@ -466,18 +470,24 @@ def hybrid_search(query: str, top_k: int, where: dict | None, *, collection, kw_
             related_candidates.append(c)
             
     if not final_results:
-        return {
+        ret = {
             "results": [],
             "status": "insufficient_evidence",
             "related_candidates": related_candidates,
             "rerank": rerank_status,
             "rerank_reason": rerank_reason,
         }
-        
-    return {
-        "results": final_results,
-        "status": "ok",
-        "related_candidates": related_candidates,
-        "rerank": rerank_status,
-        "rerank_reason": rerank_reason,
-    }
+    else:
+        ret = {
+            "results": final_results,
+            "status": "ok",
+            "related_candidates": related_candidates,
+            "rerank": rerank_status,
+            "rerank_reason": rerank_reason,
+        }
+
+    if vector_degraded:
+        ret["degraded"] = "vector_search_failed"
+        ret["degraded_error"] = str(vector_degraded_error)
+
+    return ret

@@ -23,39 +23,84 @@ if str(PROJECT_ROOT) not in sys.path:
 from migrate_v2.build_v2 import read_v1_records, compute_hashes
 
 
-def find_running_graphify_processes() -> list[dict]:
-    """List running Graphify processes (python running server.py, server_http.py, bot)."""
-    matches = []
-    # Try PowerShell CimInstance on Windows
-    if sys.platform == "win32":
-        ps_cmd = (
-            "Get-CimInstance Win32_Process | "
-            "Where-Object { $_.Name -like '*python*' } | "
-            "Select-Object ProcessId, Name, CommandLine | "
-            "ConvertTo-Json -Compress"
+_last_process_error: str | None = None
+
+
+def get_last_process_error() -> str | None:
+    """Return the last error reason encountered during process inspection."""
+    return _last_process_error
+
+
+def find_running_graphify_processes() -> list[dict] | None:
+    """List running Graphify processes (python running server.py, server_http.py, bot).
+
+    Returns:
+        list[dict] of running processes if check succeeds (empty list if none found).
+        None if check fails (timeout, non-zero return code, JSON error, non-Windows, etc.).
+    """
+    global _last_process_error
+    _last_process_error = None
+
+    if sys.platform != "win32":
+        _last_process_error = "Windows bo'lmagan operatsion tizim"
+        return None
+
+    ps_cmd = (
+        "@(Get-CimInstance Win32_Process | "
+        "Where-Object { $_.Name -like '*python*' } | "
+        "Select-Object ProcessId, Name, CommandLine) | "
+        "ConvertTo-Json -Compress"
+    )
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
-        try:
-            res = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if res.returncode == 0 and res.stdout.strip():
-                try:
-                    data = json.loads(res.stdout)
-                    if isinstance(data, dict):
-                        data = [data]
-                    for item in data:
-                        cmd = item.get("CommandLine") or ""
-                        pid = item.get("ProcessId")
-                        name = item.get("Name") or "python.exe"
-                        if any(k in cmd.lower() for k in ["server.py", "server_http.py", "bot"]):
-                            matches.append({"pid": pid, "executable": name})
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    except subprocess.TimeoutExpired as e:
+        _last_process_error = f"PowerShell timeout ({e.timeout}s)"
+        return None
+    except Exception as e:
+        _last_process_error = f"PowerShell ishga tushirishda xatolik: {e}"
+        return None
+
+    if res.returncode != 0:
+        err = res.stderr.strip() if res.stderr else f"rc={res.returncode}"
+        _last_process_error = f"PowerShell xatolik kodi qaytardi ({err})"
+        return None
+
+    stdout = res.stdout.strip()
+    if not stdout:
+        _last_process_error = "PowerShell bo'sh chiqish qaytardi (JSON kutilgan edi)"
+        return None
+
+    try:
+        data = json.loads(stdout)
+    except Exception as e:
+        _last_process_error = f"PowerShell JSON javobini o'qib bo'lmadi: {e}"
+        return None
+
+    if data is None:
+        _last_process_error = "PowerShell bo'sh JSON (null) qaytardi"
+        return None
+
+    if isinstance(data, dict):
+        data = [data]
+    elif not isinstance(data, list):
+        _last_process_error = f"PowerShell JSON ro'yxat emas: {type(data).__name__}"
+        return None
+
+    matches = []
+    for item in data:
+        if not isinstance(item, dict):
+            _last_process_error = f"PowerShell jarayon elementi noto'g'ri (lug'at emas): {item!r}"
+            return None
+        cmd = item.get("CommandLine") or ""
+        pid = item.get("ProcessId")
+        name = item.get("Name") or "python.exe"
+        if any(k in cmd.lower() for k in ["server.py", "server_http.py", "bot"]):
+            matches.append({"pid": pid, "executable": name})
 
     return matches
 
@@ -309,18 +354,6 @@ def check_v2_identity(v2_dir: Path) -> dict:
     if m_norm is None:
         return {"status": "FAIL", "error": "Manifestda 'normalization' topilmadi"}
 
-    def _parse_bool(val):
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, int) and val in (0, 1):
-            return bool(val)
-        s = str(val).strip().lower()
-        if s in ("true", "1"):
-            return True
-        if s in ("false", "0"):
-            return False
-        raise ValueError(f"Noto'g'ri boolean qiymat: {val}")
-
     try:
         norm_m = _parse_bool(m_norm)
     except (ValueError, TypeError, OverflowError):
@@ -390,19 +423,210 @@ def inspect_launch_configs() -> list[dict]:
     return results
 
 
+def check_v2_completeness(v2_dir: Path) -> dict:
+    """Verify completeness of v2 database build.
+
+    Checks:
+    - build_complete.json exists (if missing -> FAIL "build tugallanmagan")
+    - Model identity in build_complete.json matches graphify_manifest.json
+    - v2 collection record count (collection.count()) equals manifest.jsonl line count.
+    Opens ONLY the v2 database, never v1.
+    """
+    complete_file = v2_dir / "build_complete.json"
+    if not complete_file.exists():
+        return {
+            "status": "FAIL",
+            "error": "build tugallanmagan: build_complete.json topilmadi",
+        }
+
+    try:
+        with open(complete_file, "r", encoding="utf-8") as f:
+            complete_data = json.load(f)
+    except Exception as e:
+        return {
+            "status": "FAIL",
+            "error": f"build tugallanmagan (build_complete.json o'qishda xatolik: {e})",
+        }
+
+    if not isinstance(complete_data, dict):
+        return {
+            "status": "FAIL",
+            "error": "build tugallanmagan (build_complete.json formati noto'g'ri)",
+        }
+
+    manifest_file = v2_dir / "graphify_manifest.json"
+    if not manifest_file.exists():
+        return {
+            "status": "FAIL",
+            "error": f"graphify_manifest.json topilmadi: {manifest_file}",
+        }
+
+    try:
+        with open(manifest_file, "r", encoding="utf-8") as f:
+            manifest_data = json.load(f)
+    except Exception as e:
+        return {
+            "status": "FAIL",
+            "error": f"Manifest o'qishda xatolik: {e}",
+        }
+
+    if not isinstance(manifest_data, dict):
+        return {
+            "status": "FAIL",
+            "error": "graphify_manifest.json formati noto'g'ri (lug'at kutilgan edi)",
+        }
+
+    required_keys = ["model", "backend", "dimension", "schema_version", "distance", "normalization"]
+    for k in required_keys:
+        val = complete_data.get(k) if complete_data.get(k) is not None else complete_data.get(f"graphify:{k}")
+        if val is None:
+            return {
+                "status": "FAIL",
+                "error": f"build_complete.json da majburiy identity maydoni yetishmaydi: '{k}'",
+            }
+    complete_backend = complete_data.get("backend") if complete_data.get("backend") is not None else complete_data.get("graphify:backend")
+    manifest_backend = manifest_data.get("backend") if manifest_data.get("backend") is not None else manifest_data.get("graphify:backend")
+    has_manifest_digest = "model_digest" in manifest_data or "graphify:model_digest" in manifest_data
+    has_complete_digest = "model_digest" in complete_data or "graphify:model_digest" in complete_data
+    is_ollama = str(complete_backend or "").lower() == "ollama" or str(manifest_backend or "").lower() == "ollama"
+
+    if is_ollama or has_manifest_digest or has_complete_digest:
+        digest_val = complete_data.get("model_digest") if complete_data.get("model_digest") is not None else complete_data.get("graphify:model_digest")
+        if digest_val is None:
+            return {
+                "status": "FAIL",
+                "error": "build_complete.json da majburiy identity maydoni yetishmaydi: 'model_digest'",
+            }
+
+    from identity_utils import _check_source_internal_conflict, _check_identity_conflict
+    from embedders import ModelIdentityError
+
+    try:
+        _check_source_internal_conflict(complete_data, "build_complete")
+        _check_source_internal_conflict(manifest_data, "Manifest")
+        _check_identity_conflict(complete_data, "build_complete", manifest_data, "manifest")
+    except ModelIdentityError as e:
+        return {
+            "status": "FAIL",
+            "error": f"build_complete.json va graphify_manifest.json mos kelmadi: {e}",
+        }
+
+    manifest_l_path = v2_dir / "manifest.jsonl"
+    if not manifest_l_path.exists():
+        return {
+            "status": "FAIL",
+            "error": f"manifest.jsonl topilmadi: {manifest_l_path}",
+        }
+
+    manifest_lines = 0
+    try:
+        with open(manifest_l_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    manifest_lines += 1
+    except Exception as e:
+        return {
+            "status": "FAIL",
+            "error": f"manifest.jsonl o'qishda xatolik: {e}",
+        }
+
+    import gc
+    import tempfile
+    import shutil
+    import chromadb
+
+    col_count = None
+    client_error = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="graphify-v2-check-", ignore_cleanup_errors=True) as tmp_check_dir:
+            tmp_check_path = Path(tmp_check_dir)
+            sqlite_src = v2_dir / "chroma.sqlite3"
+            if sqlite_src.exists():
+                shutil.copy2(sqlite_src, tmp_check_path / "chroma.sqlite3")
+                for extra in ("chroma.sqlite3-wal", "chroma.sqlite3-shm"):
+                    if (v2_dir / extra).exists():
+                        shutil.copy2(v2_dir / extra, tmp_check_path / extra)
+
+            client = None
+            col = None
+            try:
+                try:
+                    client = chromadb.PersistentClient(path=str(tmp_check_path))
+                    col = client.get_collection("graphify")
+                    col_count = col.count()
+                finally:
+                    try:
+                        if client is not None:
+                            if hasattr(client, "close") and callable(client.close):
+                                client.close()
+                            elif hasattr(client, "_system") and hasattr(client._system, "stop") and callable(client._system.stop):
+                                client._system.stop()
+                    finally:
+                        del client, col
+                        gc.collect()
+            except Exception as e:
+                client_error = e
+    except Exception as e:
+        if col_count is None or client_error is not None:
+            err = client_error or e
+            return {
+                "status": "FAIL",
+                "error": f"v2 kolleksiyasini ochishda xatolik: {err}",
+            }
+
+    if client_error is not None:
+        return {
+            "status": "FAIL",
+            "error": f"v2 kolleksiyasini ochishda xatolik: {client_error}",
+        }
+
+    if col_count is None:
+        return {
+            "status": "FAIL",
+            "error": "v2 kolleksiyasini ochishda xatolik",
+        }
+
+    if col_count != manifest_lines:
+        return {
+            "status": "FAIL",
+            "error": f"v2 kolleksiya yozuv soni ({col_count}) manifest.jsonl qatorlar soni ({manifest_lines}) bilan teng emas",
+        }
+
+    return {
+        "status": "PASS",
+        "count": col_count,
+        "manifest_lines": manifest_lines,
+    }
+
+
 def print_checklist(
-    processes: list[dict], drift: dict, identity: dict, launch_configs: list[dict], v1_dir: Path, v2_dir: Path
-) -> None:
-    """Print formatted pre-switch checklist and ordered execution steps."""
+    processes: list[dict] | None,
+    drift: dict,
+    identity: dict,
+    launch_configs: list[dict],
+    v1_dir: Path,
+    v2_dir: Path,
+    completeness: dict | None = None,
+) -> bool:
+    """Print formatted pre-switch checklist and ordered execution steps.
+
+    Returns True if system is ready to switch, False otherwise.
+    """
+    if completeness is None and v2_dir is not None:
+        completeness = check_v2_completeness(v2_dir)
+
     print("=" * 70)
-    print("📋 GRAPHIFY v2 O'TISH OLDIDAN TEKSHIRUV (SWITCH CHECKLIST)")
+    print("[CHECKLIST] GRAPHIFY v2 O'TISH OLDIDAN TEKSHIRUV (SWITCH CHECKLIST)")
     print("   (Read-only rejim: hech qanday o'zgartirish kiritilmadi)")
     print("=" * 70)
 
     # 1. Running processes
     print("\n1. ISHLAB TURGAN GRAPHIFY JARAYONLARI:")
-    if processes:
-        print(f"   ??  Topildi: {len(processes)} ta faol jarayon:")
+    if processes is None:
+        err = get_last_process_error() or "jarayonlarni tekshirib bo'lmadi"
+        print(f"   [FAIL] Yozuvchi jarayonlarni tekshirib bo'lmadi: {err}")
+    elif processes:
+        print(f"   [WARN] Topildi: {len(processes)} ta faol jarayon:")
         for p in processes:
             exe = p.get("executable")
             if not exe and "command" in p:
@@ -417,32 +641,40 @@ def print_checklist(
             print(f"      - PID {p['pid']}: {exe}")
         print("   -> O'tishdan oldin ushbu yozuvchi jarayonlar to'xtatilishi shart.")
     else:
-        print("   ? Faol Graphify yozuvchi jarayonlari topilmadi.")
+        print("   [PASS] Faol Graphify yozuvchi jarayonlari topilmadi.")
 
     # 2. Drift
     print("\n2. v1 VA v2 MANIFEST O'RTASIDAGI FARQ (DRIFT):")
     if drift.get("status") == "OK":
-        td = drift["total_drift"]
+        td = drift.get("total_drift", 0)
         if td == 0:
-            print(f"   ? Drift = 0 (v1 va v2 to'liq sinxron, jami {drift['total_v1']} ta yozuv).")
+            print(f"   [PASS] Drift = 0 (v1 va v2 to'liq sinxron, jami {drift.get('total_v1', 0)} ta yozuv).")
         else:
-            print(f"   ??  Drift mavjud: {td} ta o'zgarish!")
-            print(f"      - v1 dagi yangi: {drift['new_in_v1']} ta")
-            print(f"      - v1 da o'zgargan: {drift['modified_in_v1']} ta")
-            print(f"      - v1 da o'chirilgan: {drift['deleted_in_v1']} ta")
+            print(f"   [WARN] Drift mavjud: {td} ta o'zgarish!")
+            print(f"      - v1 dagi yangi: {drift.get('new_in_v1', 0)} ta")
+            print(f"      - v1 da o'zgargan: {drift.get('modified_in_v1', 0)} ta")
+            print(f"      - v1 da o'chirilgan: {drift.get('deleted_in_v1', 0)} ta")
             print("   -> O'tishdan oldin oxirgi sinxronizatsiya bajarilishi shart.")
     else:
-        print(f"   ??  Drift tekshiruvi: {drift.get('message')}")
+        print(f"   [FAIL] Drift tekshiruvi: {drift.get('message')}")
 
-    # 3. Model Identity
-    print("\n3. v2 MODEL IDENTIFIKATSIYASI VA SELF-TEST:")
+    # 3. Model Identity & Completeness
+    print("\n3. v2 MODEL IDENTIFIKATSIYASI VA BAZA TO'LIQLIGI (SELF-TEST):")
     if identity.get("status") == "PASS":
-        print(f"   ? Self-test: PASS")
+        print("   [PASS] Self-test: PASS")
         print(f"      - Model: {identity.get('model')} ({identity.get('dimension')}-d)")
         print(f"      - Backend: {identity.get('backend')}")
-        print(f"      - Digest: {identity.get('digest')[:24]}...")
+        digest = identity.get("digest")
+        digest_str = f"{digest[:24]}..." if digest else "-"
+        print(f"      - Digest: {digest_str}")
     else:
-        print(f"   ? Self-test: FAIL ({identity.get('error')})")
+        print(f"   [FAIL] Self-test: FAIL ({identity.get('error')})")
+
+    if completeness is not None:
+        if completeness.get("status") == "PASS":
+            print(f"   [PASS] Baza to'liqligi: PASS ({completeness.get('count', 0)} ta yozuv)")
+        else:
+            print(f"   [FAIL] Baza to'liqligi: FAIL ({completeness.get('error')})")
 
     # 4. Launch Configs
     print("\n4. SOZLAMA FAYLLARI (Faqat kalit nomi tekshirildi, qiymatlar yashirin):")
@@ -452,7 +684,7 @@ def print_checklist(
 
     # 5. Ordered steps
     print("\n" + "=" * 70)
-    print("?? TARTIBLANGAN O'TISH BOSQICHLARI (ORDERED SWITCH STEPS):")
+    print("[QADAMLAR] TARTIBLANGAN O'TISH BOSQICHLARI (ORDERED SWITCH STEPS):")
     print("=" * 70)
     print("1. Barcha yozuvchi xizmatlarni to'xtatish (MCP, HTTP server, Telegram bot).")
     print(f"2. Yakuniy muzlatish va sinxronizatsiya: python migrate_v2/build_v2.py --sync --v1-db {v1_dir} --out {v2_dir}")
@@ -463,7 +695,7 @@ def print_checklist(
     print("7. Yozish rejimini qayta ochish.\n")
 
     print("=" * 70)
-    print("?? ORQAGA QAYTISH BOSQICHLARI (ORDERED ROLLBACK STEPS):")
+    print("[ROLLBACK] ORQAGA QAYTISH BOSQICHLARI (ORDERED ROLLBACK STEPS):")
     print("=" * 70)
     print("1. v2 dagi yozuvchi jarayonlarni zudlik bilan to'xtatish.")
     print("2. v2 da yaratilgan yangi yozuvlarni v1 ga yarashtirish (reconciliation).")
@@ -472,11 +704,29 @@ def print_checklist(
     print("5. Xizmatlarni qayta ishga tushirish.")
     print("6. v1 ishini tekshirib, yozishni qayta ochish.\n")
 
+    is_ready = (
+        processes is not None
+        and len(processes) == 0
+        and drift.get("status") == "OK"
+        and drift.get("total_drift", 0) == 0
+        and identity.get("status") == "PASS"
+        and (completeness is None or completeness.get("status") == "PASS")
+    )
+
+    print("=" * 70)
+    if is_ready:
+        print("XULOSA: [PASS] Tizim v2 ga o'tishga tayyor.")
+    else:
+        print("XULOSA: [FAIL] Tizim v2 ga o'tishga tayyor emas.")
+    print("=" * 70)
+
+    return is_ready
+
 
 def main():
     parser = argparse.ArgumentParser(description="Pre-switch checklist for Graphify v2")
     parser.add_argument("--v1-db", default="kg_db", help="Path to v1 database (default: kg_db)")
-    parser.add_argument("--v2-db", default="kg_db_v2", help="Path to v2 database (default: kg_db_v2)")
+    parser.add_argument("--v2-db", default="kg_db_v2b", help="Path to v2 database (default: kg_db_v2b)")
     args = parser.parse_args()
 
     v1_dir = Path(args.v1_db)
@@ -485,9 +735,12 @@ def main():
     processes = find_running_graphify_processes()
     drift = check_v1_manifest_drift(v1_dir, v2_dir)
     identity = check_v2_identity(v2_dir)
+    completeness = check_v2_completeness(v2_dir)
     launch_configs = inspect_launch_configs()
 
-    print_checklist(processes, drift, identity, launch_configs, v1_dir, v2_dir)
+    is_ready = print_checklist(processes, drift, identity, launch_configs, v1_dir, v2_dir, completeness=completeness)
+    if not is_ready:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

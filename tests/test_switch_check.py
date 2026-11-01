@@ -5,6 +5,7 @@ All tests use temporary directories, mock Ollama / network, and never touch live
 
 import json
 import sqlite3
+import subprocess
 import sys
 from io import StringIO
 from pathlib import Path
@@ -17,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from migrate_v2.switch_check import (
+    check_v2_completeness,
     check_v2_identity,
     find_running_graphify_processes,
     print_checklist,
@@ -513,5 +515,590 @@ def test_check_v2_identity_rejects_float_dimension_and_conflicting_prefixed_fiel
     res = check_v2_identity(v2_dir)
     assert res["status"] == "FAIL"
     assert "dimension" in res["error"]
+
+
+def test_conftest_db_isolation_regression():
+    """T1 regression: conftest sets GRAPHIFY_DB_PATH at module level to temp dir,
+    ensuring db.DB_PATH and keyword_index.DB_PATH never point to checkout kg_db.
+    """
+    import db
+    import keyword_index
+    import tempfile
+    from pathlib import Path
+
+    checkout_kg_db = Path(__file__).resolve().parents[1] / "kg_db"
+    assert str(db.DB_PATH) != str(checkout_kg_db)
+    assert str(keyword_index.DB_PATH) != str(checkout_kg_db / "keyword_index.sqlite3")
+
+    temp_dir = tempfile.gettempdir()
+    assert str(db.DB_PATH).startswith(temp_dir) or "graphify-test-" in str(db.DB_PATH)
+    assert str(keyword_index.DB_PATH).startswith(temp_dir) or "graphify-test-" in str(keyword_index.DB_PATH)
+    assert not checkout_kg_db.exists()
+
+
+def test_find_running_graphify_processes_fail_closed_rc_nonzero(monkeypatch):
+    """T2 regression: returncode != 0 causes find_running_graphify_processes to return None and checklist to FAIL."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    mock_run = Mock()
+    mock_run.returncode = 1
+    mock_run.stdout = ""
+    mock_run.stderr = "PowerShell error"
+
+    with patch("subprocess.run", return_value=mock_run):
+        procs = find_running_graphify_processes()
+        assert procs is None
+
+    captured = StringIO()
+    monkeypatch.setattr(sys, "stdout", captured)
+    ready = print_checklist(
+        processes=procs,
+        drift={"status": "OK", "total_drift": 0, "total_v1": 10},
+        identity={"status": "PASS", "model": "m", "backend": "b", "dimension": 10, "digest": "d"},
+        launch_configs=[],
+        v1_dir=Path("v1"),
+        v2_dir=Path("v2"),
+        completeness={"status": "PASS", "count": 10},
+    )
+    output = captured.getvalue()
+    assert "[FAIL] Yozuvchi jarayonlarni tekshirib bo'lmadi" in output
+    assert "tayyor emas" in output
+    assert ready is False
+
+
+def test_find_running_graphify_processes_fail_closed_timeout(monkeypatch):
+    """T2 regression: subprocess.TimeoutExpired causes find_running_graphify_processes to return None and checklist to FAIL."""
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="powershell", timeout=10)
+
+    with patch("subprocess.run", side_effect=_timeout):
+        procs = find_running_graphify_processes()
+        assert procs is None
+
+    captured = StringIO()
+    monkeypatch.setattr(sys, "stdout", captured)
+    ready = print_checklist(
+        processes=procs,
+        drift={"status": "OK", "total_drift": 0, "total_v1": 10},
+        identity={"status": "PASS", "model": "m", "backend": "b", "dimension": 10, "digest": "d"},
+        launch_configs=[],
+        v1_dir=Path("v1"),
+        v2_dir=Path("v2"),
+        completeness={"status": "PASS", "count": 10},
+    )
+    output = captured.getvalue()
+    assert "[FAIL] Yozuvchi jarayonlarni tekshirib bo'lmadi" in output
+    assert "timeout" in output.lower()
+    assert ready is False
+
+
+def test_find_running_graphify_processes_fail_closed_invalid_json(monkeypatch):
+    """T2 regression: invalid JSON from PowerShell causes find_running_graphify_processes to return None and checklist to FAIL."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    mock_run = Mock()
+    mock_run.returncode = 0
+    mock_run.stdout = "This is not JSON at all!"
+
+    with patch("subprocess.run", return_value=mock_run):
+        procs = find_running_graphify_processes()
+        assert procs is None
+
+    captured = StringIO()
+    monkeypatch.setattr(sys, "stdout", captured)
+    ready = print_checklist(
+        processes=procs,
+        drift={"status": "OK", "total_drift": 0, "total_v1": 10},
+        identity={"status": "PASS", "model": "m", "backend": "b", "dimension": 10, "digest": "d"},
+        launch_configs=[],
+        v1_dir=Path("v1"),
+        v2_dir=Path("v2"),
+        completeness={"status": "PASS", "count": 10},
+    )
+    output = captured.getvalue()
+    assert "[FAIL] Yozuvchi jarayonlarni tekshirib bo'lmadi" in output
+    assert ready is False
+
+
+def test_find_running_graphify_processes_non_windows_returns_none(monkeypatch):
+    """T2 regression: non-Windows OS returns None (fail-closed, not [])."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    procs = find_running_graphify_processes()
+    assert procs is None
+
+
+def test_check_v2_completeness_missing_build_complete_fails(tmp_path):
+    """T3 regression: missing build_complete.json causes check_v2_completeness to FAIL."""
+    v2_dir = tmp_path / "v2_no_complete"
+    v2_dir.mkdir()
+    (v2_dir / "graphify_manifest.json").write_text("{}", encoding="utf-8")
+
+    res = check_v2_completeness(v2_dir)
+    assert res["status"] == "FAIL"
+    assert "build tugallanmagan" in res["error"]
+    assert "build_complete.json topilmadi" in res["error"]
+
+
+def test_check_v2_completeness_identity_mismatch_fails(tmp_path):
+    """T3 regression: model identity mismatch between build_complete.json and graphify_manifest.json FAILS."""
+    v2_dir = tmp_path / "v2_mismatch"
+    v2_dir.mkdir()
+    manifest_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:manifest_digest",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+    complete_id = dict(manifest_id, model="different-model")
+
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "build_complete.json").write_text(json.dumps(complete_id), encoding="utf-8")
+
+    res = check_v2_completeness(v2_dir)
+    assert res["status"] == "FAIL"
+    assert "mos kelmadi" in res["error"]
+
+
+def test_check_v2_completeness_record_count_mismatch_fails(tmp_path):
+    """T3 regression: collection.count() != manifest.jsonl lines FAILS."""
+    v2_dir = tmp_path / "v2_count_mismatch"
+    v2_dir.mkdir()
+    manifest_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:digest",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "build_complete.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+
+    # 3 lines in manifest.jsonl
+    manifest_lines = ['{"id": "doc1"}\n', '{"id": "doc2"}\n', '{"id": "doc3"}\n']
+    (v2_dir / "manifest.jsonl").write_text("".join(manifest_lines), encoding="utf-8")
+
+    # Mock collection with count=2 (mismatch!)
+    mock_col = Mock()
+    mock_col.count.return_value = 2
+    mock_client = Mock()
+    mock_client.get_collection.return_value = mock_col
+
+    with patch("chromadb.PersistentClient", return_value=mock_client):
+        res = check_v2_completeness(v2_dir)
+        assert res["status"] == "FAIL"
+        assert "teng emas" in res["error"]
+
+
+def test_check_v2_completeness_success(tmp_path):
+    """T3 regression: valid build_complete.json matching manifest and equal record counts PASSES."""
+    v2_dir = tmp_path / "v2_ok"
+    v2_dir.mkdir()
+    manifest_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:digest",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "build_complete.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+
+    manifest_lines = ['{"id": "doc1"}\n', '{"id": "doc2"}\n']
+    (v2_dir / "manifest.jsonl").write_text("".join(manifest_lines), encoding="utf-8")
+
+    mock_col = Mock()
+    mock_col.count.return_value = 2
+    mock_client = Mock()
+    mock_client.get_collection.return_value = mock_col
+
+    with patch("chromadb.PersistentClient", return_value=mock_client):
+        res = check_v2_completeness(v2_dir)
+        assert res["status"] == "PASS"
+        assert res["count"] == 2
+
+
+def test_print_checklist_none_digest_does_not_crash(monkeypatch):
+    """T4 regression: None digest does not raise TypeError and prints '-'."""
+    captured = StringIO()
+    monkeypatch.setattr(sys, "stdout", captured)
+
+    identity = {
+        "status": "PASS",
+        "model": "bge-m3",
+        "backend": "local",
+        "dimension": 1024,
+        "digest": None,
+    }
+    ready = print_checklist(
+        processes=[],
+        drift={"status": "OK", "total_drift": 0, "total_v1": 5},
+        identity=identity,
+        launch_configs=[],
+        v1_dir=Path("v1"),
+        v2_dir=Path("v2"),
+        completeness={"status": "PASS", "count": 5},
+    )
+    output = captured.getvalue()
+    assert "- Digest: -" in output
+    assert ready is True
+
+
+def test_find_running_graphify_processes_fail_closed_empty_stdout(monkeypatch):
+    """Finding 152 / T2 regression: empty stdout with rc=0 returns None (fail-closed, not [])."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    mock_run = Mock()
+    mock_run.returncode = 0
+    mock_run.stdout = "   \n  "
+    mock_run.stderr = ""
+
+    with patch("subprocess.run", return_value=mock_run):
+        procs = find_running_graphify_processes()
+        assert procs is None
+
+
+def test_find_running_graphify_processes_fail_closed_null_json(monkeypatch):
+    """Finding 153 / T2 regression: 'null' JSON from PowerShell returns None."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    mock_run = Mock()
+    mock_run.returncode = 0
+    mock_run.stdout = "null"
+
+    with patch("subprocess.run", return_value=mock_run):
+        procs = find_running_graphify_processes()
+        assert procs is None
+
+
+def test_find_running_graphify_processes_fail_closed_non_dict_element(monkeypatch):
+    """Finding 153 / T2 regression: non-dict element e.g. [1, 2] returns None."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    mock_run = Mock()
+    mock_run.returncode = 0
+    mock_run.stdout = "[1, 2]"
+
+    with patch("subprocess.run", return_value=mock_run):
+        procs = find_running_graphify_processes()
+        assert procs is None
+
+
+def test_find_running_graphify_processes_valid_empty_array_returns_empty_list(monkeypatch):
+    """Finding 152 / T2 regression: '[]' JSON from PowerShell returns [] (success, 0 processes)."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    mock_run = Mock()
+    mock_run.returncode = 0
+    mock_run.stdout = "[]"
+
+    with patch("subprocess.run", return_value=mock_run):
+        procs = find_running_graphify_processes()
+        assert procs == []
+
+
+def test_check_v2_completeness_manifest_list_format_fails(tmp_path):
+    """Finding 154 / T3 regression: graphify_manifest.json containing [] fails gracefully with FAIL status."""
+    v2_dir = tmp_path / "v2_list_manifest"
+    v2_dir.mkdir()
+    (v2_dir / "build_complete.json").write_text("{}", encoding="utf-8")
+    (v2_dir / "graphify_manifest.json").write_text("[]", encoding="utf-8")
+
+    res = check_v2_completeness(v2_dir)
+    assert res["status"] == "FAIL"
+    assert "formati noto'g'ri" in res["error"]
+
+
+def test_check_v2_completeness_missing_required_identity_keys_fails(tmp_path):
+    """Finding 151 / T3 regression: build_complete.json missing required identity fields FAILS."""
+    v2_dir = tmp_path / "v2_missing_keys"
+    v2_dir.mkdir()
+    manifest_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:digest",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "build_complete.json").write_text(json.dumps({"model": "bge-m3"}), encoding="utf-8")
+
+    res = check_v2_completeness(v2_dir)
+    assert res["status"] == "FAIL"
+    assert "majburiy identity maydoni yetishmaydi" in res["error"]
+
+
+def test_check_v2_completeness_read_only_isolated_copy(tmp_path):
+    """Finding 150 / T3 regression: collection.count() runs on isolated copy and does not mutate v2_dir."""
+    v2_dir = tmp_path / "v2_empty_check"
+    v2_dir.mkdir()
+    manifest_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:digest",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "build_complete.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "manifest.jsonl").write_text('{"id": "doc1"}\n', encoding="utf-8")
+
+    assert not (v2_dir / "chroma.sqlite3").exists()
+
+    res = check_v2_completeness(v2_dir)
+    assert res["status"] == "FAIL"
+    assert not (v2_dir / "chroma.sqlite3").exists()
+
+
+def test_conftest_checkout_kg_db_never_created_regression():
+    """Finding 155 / T1 regression: verifies checkout kg_db was not created and is guarded by conftest sessionfinish."""
+    checkout_kg_db = Path(__file__).resolve().parents[1] / "kg_db"
+    assert not checkout_kg_db.exists()
+
+
+def test_check_v2_completeness_closes_client_after_count(tmp_path):
+    """T1: chromadb.PersistentClient is closed after col.count() before tempdir cleanup."""
+    v2_dir = tmp_path / "v2_close_test"
+    v2_dir.mkdir()
+    manifest_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:digest",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "build_complete.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "manifest.jsonl").write_text('{"id": "doc1"}\n{"id": "doc2"}\n', encoding="utf-8")
+
+    # 1. Test client.close() called after count()
+    call_order = []
+    mock_col = Mock()
+    mock_col.count.side_effect = lambda: (call_order.append("count"), 2)[1]
+    mock_client = Mock()
+    mock_client.get_collection.return_value = mock_col
+    mock_client.close.side_effect = lambda: call_order.append("close")
+
+    with patch("chromadb.PersistentClient", return_value=mock_client):
+        res = check_v2_completeness(v2_dir)
+        assert res["status"] == "PASS"
+        assert res["count"] == 2
+        assert mock_client.close.called
+        assert call_order == ["count", "close"]
+
+    # 2. Test fallback to client._system.stop() when client.close is absent
+    call_order_fallback = []
+    mock_col_fallback = Mock()
+    mock_col_fallback.count.side_effect = lambda: (call_order_fallback.append("count"), 2)[1]
+    mock_client_fallback = Mock(spec=["get_collection", "_system"])
+    mock_client_fallback.get_collection.return_value = mock_col_fallback
+    mock_client_fallback._system = Mock()
+    mock_client_fallback._system.stop.side_effect = lambda: call_order_fallback.append("stop")
+
+    with patch("chromadb.PersistentClient", return_value=mock_client_fallback):
+        res_fb = check_v2_completeness(v2_dir)
+        assert res_fb["status"] == "PASS"
+        assert res_fb["count"] == 2
+        assert mock_client_fallback._system.stop.called
+        assert call_order_fallback == ["count", "stop"]
+
+
+def test_check_v2_completeness_temporary_directory_cleanup_permission_error_passes(tmp_path):
+    """T1: PermissionError during TemporaryDirectory cleanup does not fail a valid check."""
+    v2_dir = tmp_path / "v2_cleanup_perm_err"
+    v2_dir.mkdir()
+    manifest_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:digest",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "build_complete.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "manifest.jsonl").write_text('{"id": "doc1"}\n{"id": "doc2"}\n', encoding="utf-8")
+
+    mock_col = Mock()
+    mock_col.count.return_value = 2
+    mock_client = Mock()
+    mock_client.get_collection.return_value = mock_col
+
+    import tempfile
+    orig_td = tempfile.TemporaryDirectory
+
+    class FailingCleanupTempDir(orig_td):
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            super().__exit__(exc_type, exc_val, exc_tb)
+            raise PermissionError("[WinError 32] The process cannot access the file because it is being used by another process")
+
+    with patch("chromadb.PersistentClient", return_value=mock_client):
+        with patch("tempfile.TemporaryDirectory", FailingCleanupTempDir):
+            res = check_v2_completeness(v2_dir)
+            assert res["status"] == "PASS"
+            assert res["count"] == 2
+
+
+def test_check_v2_completeness_get_collection_error_remains_fail(tmp_path):
+    """T1: get_collection failure remains FAIL and client is still closed in finally."""
+    v2_dir = tmp_path / "v2_get_col_err"
+    v2_dir.mkdir()
+    manifest_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:digest",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "build_complete.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "manifest.jsonl").write_text('{"id": "doc1"}\n', encoding="utf-8")
+
+    mock_client = Mock()
+    mock_client.get_collection.side_effect = ValueError("Collection 'graphify' does not exist")
+
+    with patch("chromadb.PersistentClient", return_value=mock_client):
+        res = check_v2_completeness(v2_dir)
+        assert res["status"] == "FAIL"
+        assert "v2 kolleksiyasini ochishda xatolik" in res["error"]
+        assert "Collection 'graphify' does not exist" in res["error"]
+        assert mock_client.close.called
+
+
+def test_check_v2_completeness_client_close_permission_error_fails(tmp_path):
+    """T1 / Review Finding: PermissionError during client.close() returns FAIL and gc.collect() runs."""
+    v2_dir = tmp_path / "v2_close_perm_err"
+    v2_dir.mkdir()
+    manifest_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:digest",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "build_complete.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "manifest.jsonl").write_text('{"id": "doc1"}\n', encoding="utf-8")
+
+    mock_col = Mock()
+    mock_col.count.return_value = 1
+    mock_client = Mock()
+    mock_client.get_collection.return_value = mock_col
+    mock_client.close.side_effect = PermissionError("[WinError 32] client.close lock error")
+
+    with patch("chromadb.PersistentClient", return_value=mock_client), \
+         patch("gc.collect") as mock_gc:
+        res = check_v2_completeness(v2_dir)
+        assert res["status"] == "FAIL"
+        assert "v2 kolleksiyasini ochishda xatolik" in res["error"]
+        assert "client.close lock error" in res["error"]
+        assert mock_client.close.called
+        assert mock_gc.called
+
+
+def test_check_v2_completeness_system_stop_permission_error_fails(tmp_path):
+    """T1 / Review Finding: PermissionError during client._system.stop() returns FAIL and gc.collect() runs."""
+    v2_dir = tmp_path / "v2_stop_perm_err"
+    v2_dir.mkdir()
+    manifest_id = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:digest",
+        "dimension": 1024,
+        "distance": "cosine",
+        "normalization": False,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "build_complete.json").write_text(json.dumps(manifest_id), encoding="utf-8")
+    (v2_dir / "manifest.jsonl").write_text('{"id": "doc1"}\n', encoding="utf-8")
+
+    mock_col = Mock()
+    mock_col.count.return_value = 1
+    mock_client = Mock(spec=["get_collection", "_system"])
+    mock_client.get_collection.return_value = mock_col
+    mock_client._system = Mock()
+    mock_client._system.stop.side_effect = PermissionError("[WinError 32] _system.stop lock error")
+
+    with patch("chromadb.PersistentClient", return_value=mock_client), \
+         patch("gc.collect") as mock_gc:
+        res = check_v2_completeness(v2_dir)
+        assert res["status"] == "FAIL"
+        assert "v2 kolleksiyasini ochishda xatolik" in res["error"]
+        assert "_system.stop lock error" in res["error"]
+        assert mock_client._system.stop.called
+        assert mock_gc.called
+
+
+def test_check_v2_completeness_prefixed_keys_ollama_missing_digest_fails(tmp_path):
+    """T2: graphify: prefixed keys for Ollama backend without model_digest in marker FAILS."""
+    v2_dir = tmp_path / "v2_prefixed_missing_digest"
+    v2_dir.mkdir()
+    manifest_data = {
+        "graphify:schema_version": 2,
+        "graphify:backend": "ollama",
+        "graphify:model": "bge-m3",
+        "graphify:model_digest": "sha256:digest_123",
+        "graphify:dimension": 1024,
+        "graphify:distance": "cosine",
+        "graphify:normalization": False,
+    }
+    complete_data = {
+        "graphify:schema_version": 2,
+        "graphify:backend": "ollama",
+        "graphify:model": "bge-m3",
+        "graphify:dimension": 1024,
+        "graphify:distance": "cosine",
+        "graphify:normalization": False,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+    (v2_dir / "build_complete.json").write_text(json.dumps(complete_data), encoding="utf-8")
+
+    res = check_v2_completeness(v2_dir)
+    assert res["status"] == "FAIL"
+    assert "majburiy identity maydoni yetishmaydi: 'model_digest'" in res["error"]
+
+
+def test_check_v2_completeness_prefixed_keys_ollama_with_digest_passes(tmp_path):
+    """T2: graphify: prefixed keys for Ollama backend with matching model_digest in marker PASSES."""
+    v2_dir = tmp_path / "v2_prefixed_ok"
+    v2_dir.mkdir()
+    manifest_data = {
+        "graphify:schema_version": 2,
+        "graphify:backend": "ollama",
+        "graphify:model": "bge-m3",
+        "graphify:model_digest": "sha256:digest_123",
+        "graphify:dimension": 1024,
+        "graphify:distance": "cosine",
+        "graphify:normalization": False,
+    }
+    complete_data = dict(manifest_data)
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+    (v2_dir / "build_complete.json").write_text(json.dumps(complete_data), encoding="utf-8")
+    (v2_dir / "manifest.jsonl").write_text('{"id": "doc1"}\n{"id": "doc2"}\n', encoding="utf-8")
+
+    mock_col = Mock()
+    mock_col.count.return_value = 2
+    mock_client = Mock()
+    mock_client.get_collection.return_value = mock_col
+
+    with patch("chromadb.PersistentClient", return_value=mock_client):
+        res = check_v2_completeness(v2_dir)
+        assert res["status"] == "PASS"
+        assert res["count"] == 2
+
 
 
