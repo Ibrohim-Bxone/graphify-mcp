@@ -14,8 +14,9 @@ RERANK_TOP_N = 20
 
 # IDF-weighted coverage chegarasi: "yetarli dalil" deb topish uchun so'rov
 # og'irligining kamida shuncha ulushi hujjatda uchrashi kerak (0.5 = 50%).
-# 0.5 precision-set o'lchovi asosida tanlangan (2026-10-29): 0.8 da R@10 0.16, 0.5 da 0.50.
-MIN_COVERAGE = 0.5
+# 0.65 tanlandi (2026-11-02, 200 so'rov, kg_db_v2d): R@1 0.30, R@10 0.36, noto'g'ri topildi 0.12;
+# 0.5 recall'ni oshiradi, lekin real xotira so'rovlarida top-1 ni yomonlashtirdi.
+MIN_COVERAGE = 0.65
 
 FUNCTIONAL_WORDS = {
     "nima", "nimaga", "qanday", "qanaqa", "qaysi", "qayerda", "qachon", "kim", "nega",
