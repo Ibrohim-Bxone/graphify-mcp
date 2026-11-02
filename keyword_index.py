@@ -314,6 +314,7 @@ def rebuild(no_embedder: bool = False):
                         client._system.stop()
                 except Exception as err:
                     print(f"[keyword_index] Chroma klientini yopib bo'lmadi: {err}", file=sys.stderr)
+                    raise
             del client
         else:
             from db import get_collection
