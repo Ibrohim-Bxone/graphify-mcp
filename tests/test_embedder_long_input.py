@@ -272,3 +272,18 @@ def test_e4_real_requests_blocked_by_default(assert_real_network_blocked):
     with pytest.raises(AssertionError, match="Real requests.post must never be called"):
         requests.post("http://127.0.0.1:11434/api/embeddings")
 
+
+
+def test_context_length_error_body_from_real_ollama_halves_input(monkeypatch):
+    """Ollama 0.x real 500 body (2026-11-02) has no token count: input is halved and retried."""
+    calls = []
+
+    def mock_post(url, json=None, timeout=None):
+        calls.append(json["prompt"])
+        if len(calls) == 1:
+            return MockResponse(500, text='{"error":"the input length exceeds the context length"}')
+        return MockResponse(200, json_data={"embedding": [0.1] * 1024})
+
+    monkeypatch.setattr(requests, "post", mock_post)
+    OllamaEmbedder(base_url="http://mock-ollama:11434", model="bge-m3").encode(["B" * 10000])
+    assert [len(p) for p in calls] == [10000, 5000]

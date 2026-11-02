@@ -155,7 +155,7 @@ class OllamaEmbedder(EmbedderBase):
                     json={"model": self._model, "prompt": current_text},
                     timeout=60,
                 )
-                if r.status_code == 500 and "too large" in r.text.lower():
+                if r.status_code == 500 and ("too large" in r.text.lower() or "exceeds the context length" in r.text.lower()):
                     if retries < 4:
                         retries += 1
                         orig_len = len(current_text)
