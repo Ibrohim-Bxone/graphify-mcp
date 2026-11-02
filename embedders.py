@@ -155,34 +155,52 @@ class OllamaEmbedder(EmbedderBase):
                     json={"model": self._model, "prompt": current_text},
                     timeout=60,
                 )
-                if r.status_code == 500 and ("too large" in r.text.lower() or "exceeds the context length" in r.text.lower()):
-                    if retries < 4:
-                        retries += 1
-                        orig_len = len(current_text)
-                        m = re.search(r"input \((\d+) tokens\) is too large", r.text, re.IGNORECASE)
-                        if m:
-                            n_tokens = int(m.group(1))
-                            new_len = int(orig_len * 8000 / n_tokens * 0.9)
-                            if new_len >= orig_len:
+                if r.status_code == 500:
+                    err_msg = ""
+                    try:
+                        data = r.json()
+                        if isinstance(data, dict):
+                            val = data.get("error")
+                            if val is not None:
+                                err_msg = str(val)
+                    except Exception:
+                        err_msg = r.text or ""
+
+                    m = re.search(r"input \((\d+) tokens\) is too large", err_msg, re.IGNORECASE)
+                    if m or ("exceeds the context length" in err_msg.lower()):
+                        if retries < 4:
+                            retries += 1
+                            orig_len = len(current_text)
+                            if m:
+                                n_tokens = int(m.group(1))
+                                new_len = int(orig_len * 8000 / n_tokens * 0.9)
+                                if new_len >= orig_len:
+                                    new_len = orig_len // 2
+                                n_val = n_tokens
+                            else:
                                 new_len = orig_len // 2
-                            n_val = n_tokens
+                                n_val = None
+                            if not (0 < new_len < orig_len):
+                                raise RuntimeError(
+                                    f"Ollama input qisqartirish xatosi: orig_len={orig_len}, new_len={new_len}"
+                                )
+                            print(
+                                f"[OllamaEmbedder] input too large, matn qisqartirildi: asl={orig_len}, yangi={new_len}, N={n_val}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            current_text = current_text[:new_len]
+                            continue
                         else:
-                            new_len = orig_len // 2
-                            n_val = None
-                        new_len = max(0, new_len)
-                        print(
-                            f"[OllamaEmbedder] input too large, matn qisqartirildi: asl={orig_len}, yangi={new_len}, N={n_val}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        current_text = current_text[:new_len]
-                        continue
-                    else:
-                        raise RuntimeError(
-                            f"Ollama input too large: matn 4 marta qisqartirilsa ham sig'madi (oxirgi javob: {r.text})"
-                        )
+                            raise RuntimeError(
+                                f"Ollama input too large: matn 4 marta qisqartirilsa ham sig'madi (oxirgi javob: {r.text})"
+                            )
                 r.raise_for_status()
-                out.append(r.json()["embedding"])
+                resp_data = r.json()
+                emb = resp_data.get("embedding") if isinstance(resp_data, dict) else None
+                if not emb:
+                    raise RuntimeError(f"Ollama bo'sh embedding qaytardi (model: {self._model})")
+                out.append(emb)
                 break
         arr = np.array(out, dtype=np.float32)
         if self._normalize and arr.size > 0:

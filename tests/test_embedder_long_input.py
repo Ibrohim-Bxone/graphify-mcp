@@ -1,9 +1,12 @@
 """Tests for OllamaEmbedder handling long inputs exceeding context length (E1, E2, E3, E4).
 
-Verifies that OllamaEmbedder truncates texts deterministically on Ollama 500 'too large'
-errors, logs the truncation to stderr, and retries up to 4 times before raising RuntimeError.
+Verifies that OllamaEmbedder truncates texts deterministically on Ollama 500
+context length errors (`input (N tokens) is too large` and `exceeds the context length`),
+logs the truncation to stderr, and retries up to 4 times before raising RuntimeError.
 All tests use monkeypatching/mocking to ensure real Ollama is never called.
 """
+
+import json
 
 import numpy as np
 import pytest
@@ -17,10 +20,12 @@ class MockResponse:
     def __init__(self, status_code: int, text: str = "", json_data: dict = None):
         self.status_code = status_code
         self.text = text
-        self._json_data = json_data or {}
+        self._json_data = json_data
 
     def json(self):
-        return self._json_data
+        if self._json_data is not None:
+            return self._json_data
+        return json.loads(self.text)
 
     def raise_for_status(self):
         if 400 <= self.status_code < 600:
@@ -178,13 +183,13 @@ def test_e2_truncation_logs_to_stderr_with_details(monkeypatch, capsys):
 
 
 def test_e1_truncation_without_token_count_halves_length(monkeypatch):
-    """E1: When N cannot be extracted from 500 'too large', text length is halved."""
+    """E1: When N cannot be extracted from 500 context error, text length is halved."""
     calls = []
 
     def mock_post(url, json=None, timeout=None):
         calls.append({"url": url, "json": json, "timeout": timeout})
         if len(calls) == 1:
-            return MockResponse(500, text='{"error": "prompt is too large"}')
+            return MockResponse(500, text='{"error": "the input length exceeds the context length"}')
         return MockResponse(200, json_data={"embedding": [0.2] * 1024})
 
     monkeypatch.setattr(requests, "post", mock_post)
@@ -287,3 +292,112 @@ def test_context_length_error_body_from_real_ollama_halves_input(monkeypatch):
     monkeypatch.setattr(requests, "post", mock_post)
     OllamaEmbedder(base_url="http://mock-ollama:11434", model="bge-m3").encode(["B" * 10000])
     assert [len(p) for p in calls] == [10000, 5000]
+
+
+def test_n1_memory_error_raises_without_truncation(monkeypatch):
+    """N1: HTTP 500 'model is too large for available memory' raises HTTPError without truncation."""
+    calls = []
+
+    def mock_post(url, json=None, timeout=None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return MockResponse(500, text='{"error": "model is too large for available memory"}')
+
+    monkeypatch.setattr(requests, "post", mock_post)
+
+    embedder = OllamaEmbedder(base_url="http://mock-ollama:11434")
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        embedder.encode(["some text to embed"])
+
+    # Must raise immediately without retry: exactly 1 call
+    assert len(calls) == 1
+    assert calls[0]["json"]["prompt"] == "some text to embed"
+
+
+def test_n1_error_field_mismatch_with_context_pattern_in_raw_text_raises_without_truncation(monkeypatch):
+    """N1: HTTP 500 where JSON 'error' does not match context error but raw text contains pattern raises HTTPError without truncation."""
+    calls = []
+
+    def mock_post(url, json=None, timeout=None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return MockResponse(
+            500,
+            text='{"error": "unrelated server failure", "raw_log": "input (9520 tokens) is too large to process"}',
+        )
+
+    monkeypatch.setattr(requests, "post", mock_post)
+
+    embedder = OllamaEmbedder(base_url="http://mock-ollama:11434")
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        embedder.encode(["some text to embed"])
+
+    # Must raise immediately without retry: exactly 1 call
+    assert len(calls) == 1
+    assert calls[0]["json"]["prompt"] == "some text to embed"
+
+
+def test_n2_single_char_context_error_raises_runtime_error_no_empty_prompt(monkeypatch):
+    """N2: Single-char input with context length error raises RuntimeError immediately without sending empty prompt."""
+    calls = []
+
+    def mock_post(url, json=None, timeout=None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return MockResponse(500, text='{"error": "the input length exceeds the context length"}')
+
+    monkeypatch.setattr(requests, "post", mock_post)
+
+    embedder = OllamaEmbedder(base_url="http://mock-ollama:11434")
+
+    with pytest.raises(RuntimeError, match="qisqartirish xatosi"):
+        embedder.encode(["A"])
+
+    # Exactly 1 call made, no empty prompt ever sent
+    assert len(calls) == 1
+    assert calls[0]["json"]["prompt"] == "A"
+    for call in calls:
+        assert call["json"]["prompt"] != "", "Empty prompt must never be sent to Ollama"
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+def test_n2_empty_embedding_response_raises_error(monkeypatch, normalize):
+    """N2: Empty embedding response `[]` raises RuntimeError regardless of normalize flag."""
+    calls = []
+
+    def mock_post(url, json=None, timeout=None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return MockResponse(200, json_data={"embedding": []})
+
+    monkeypatch.setattr(requests, "post", mock_post)
+
+    embedder = OllamaEmbedder(base_url="http://mock-ollama:11434", normalize=normalize)
+
+    with pytest.raises(RuntimeError, match="bo'sh embedding"):
+        embedder.encode(["valid text"])
+
+    assert len(calls) == 1
+
+
+
+def test_non_json_context_error_body_uses_raw_text(monkeypatch):
+    """N1: a non-JSON 500 body is matched on raw text; non-context raw text still raises."""
+    calls = []
+
+    def mock_post(url, json=None, timeout=None):
+        calls.append(json["prompt"])
+        if len(calls) == 1:
+            return MockResponse(500, text="the input length exceeds the context length")
+        return MockResponse(200, json_data={"embedding": [0.1] * 1024})
+
+    monkeypatch.setattr(requests, "post", mock_post)
+    OllamaEmbedder(base_url="http://mock-ollama:11434", model="bge-m3").encode(["C" * 1000])
+    assert [len(p) for p in calls] == [1000, 500]
+
+
+def test_empty_text_list_returns_empty_array(monkeypatch):
+    """encode([]) keeps returning an empty array without any request."""
+    def no_post(*a, **k):
+        raise AssertionError("request must not be sent")
+
+    monkeypatch.setattr(requests, "post", no_post)
+    assert OllamaEmbedder(base_url="http://mock-ollama:11434", model="bge-m3").encode([]).size == 0
