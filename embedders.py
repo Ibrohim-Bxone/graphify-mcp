@@ -142,16 +142,48 @@ class OllamaEmbedder(EmbedderBase):
         self.normalize = self._normalize
 
     def encode(self, texts):
+        import re
+        import sys
         import requests
         out = []
         for text in texts:
-            r = requests.post(
-                f"{self._base_url}/api/embeddings",
-                json={"model": self._model, "prompt": text},
-                timeout=60,
-            )
-            r.raise_for_status()
-            out.append(r.json()["embedding"])
+            current_text = text
+            retries = 0
+            while True:
+                r = requests.post(
+                    f"{self._base_url}/api/embeddings",
+                    json={"model": self._model, "prompt": current_text},
+                    timeout=60,
+                )
+                if r.status_code == 500 and "too large" in r.text.lower():
+                    if retries < 4:
+                        retries += 1
+                        orig_len = len(current_text)
+                        m = re.search(r"input \((\d+) tokens\) is too large", r.text, re.IGNORECASE)
+                        if m:
+                            n_tokens = int(m.group(1))
+                            new_len = int(orig_len * 8000 / n_tokens * 0.9)
+                            if new_len >= orig_len:
+                                new_len = orig_len // 2
+                            n_val = n_tokens
+                        else:
+                            new_len = orig_len // 2
+                            n_val = None
+                        new_len = max(0, new_len)
+                        print(
+                            f"[OllamaEmbedder] input too large, matn qisqartirildi: asl={orig_len}, yangi={new_len}, N={n_val}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        current_text = current_text[:new_len]
+                        continue
+                    else:
+                        raise RuntimeError(
+                            f"Ollama input too large: matn 4 marta qisqartirilsa ham sig'madi (oxirgi javob: {r.text})"
+                        )
+                r.raise_for_status()
+                out.append(r.json()["embedding"])
+                break
         arr = np.array(out, dtype=np.float32)
         if self._normalize and arr.size > 0:
             if arr.ndim == 1:
