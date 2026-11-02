@@ -287,9 +287,12 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
 
     captured_degraded = []
     captured_errors = []
+    total_hybrid_calls = 0
     orig_hybrid = getattr(search_core, "hybrid_search", None)
 
     def _tracking_hybrid(*args, **kwargs):
+        nonlocal total_hybrid_calls
+        total_hybrid_calls += 1
         h_res = orig_hybrid(*args, **kwargs)
         if isinstance(h_res, dict) and h_res.get("degraded"):
             captured_degraded.append(h_res["degraded"])
@@ -366,10 +369,14 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
         print(f"[graphify] Statistika xatosi ({err}), o'tkazib yuborildi.", file=sys.stderr)
     result_text = "\n\n---\n\n".join(out) if out else "No relevant results found."
     if is_degraded:
-        err_short = str(degraded_err).strip().splitlines()[0] if degraded_err else "vektor indeksi xatosi"
+        err_lines = str(degraded_err or "").strip().splitlines()
+        err_short = err_lines[0].strip() if err_lines and err_lines[0].strip() else "vektor indeksi xatosi"
         if len(err_short) > 120:
             err_short = err_short[:117] + "..."
-        warning_header = f"⚠️ Vektor qidiruv ishlamadi ({err_short}), natija faqat kalit so'z bo'yicha."
+        if total_hybrid_calls > 1 and len(captured_degraded) < total_hybrid_calls:
+            warning_header = f"⚠️ Vektor qidiruvning bir qismi ishlamadi ({err_short})."
+        else:
+            warning_header = f"⚠️ Vektor qidiruv ishlamadi ({err_short}), natija faqat kalit so'z bo'yicha."
         return f"{warning_header}\n\n{result_text}"
     return result_text
 

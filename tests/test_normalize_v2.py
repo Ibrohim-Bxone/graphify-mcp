@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -24,7 +25,7 @@ from embedders import (
     build_identity_embedder,
 )
 from migrate_v2.build_v2 import run_renormalize, run_sync
-from migrate_v2.switch_check import check_v2_normalization
+from migrate_v2.switch_check import check_v2_identity, check_v2_normalization
 
 
 # ---------------------------------------------------------------------------
@@ -531,3 +532,265 @@ def test_a3_renormalize_preserves_real_persistent_client_source_hashes(tmp_path)
         assert np.isclose(float(np.linalg.norm(v_out)), 1.0, atol=1e-3)
     if hasattr(out_client, "close"):
         out_client.close()
+
+
+def test_g1_switch_check_normalization_fail_on_nan(tmp_path):
+    """G1: check_v2_normalization returns FAIL when sample vectors contain NaN."""
+    v2_dir = tmp_path / "v2_nan"
+    unit_vec = [1.0 / np.sqrt(1024)] * 1024
+    _create_mock_v2_with_embeddings(v2_dir, [unit_vec], normalization=True, distance="cosine")
+
+    nan_vec = [float("nan"), 0.0] * 512
+    with patch.object(chromadb.api.models.Collection.Collection, "get", return_value={"embeddings": [nan_vec]}):
+        chk = check_v2_normalization(v2_dir)
+        assert chk["status"] == "FAIL"
+        assert "Namunaviy yozuv normasi 1±1e-3 oralig'ida emas" in chk.get("error", "")
+
+
+def test_g1_switch_check_normalization_fail_on_inf(tmp_path):
+    """G1: check_v2_normalization returns FAIL when sample vectors contain inf."""
+    v2_dir = tmp_path / "v2_inf"
+    unit_vec = [1.0 / np.sqrt(1024)] * 1024
+    _create_mock_v2_with_embeddings(v2_dir, [unit_vec], normalization=True, distance="cosine")
+
+    inf_vec = [float("inf"), 0.0] * 512
+    with patch.object(chromadb.api.models.Collection.Collection, "get", return_value={"embeddings": [inf_vec]}):
+        chk = check_v2_normalization(v2_dir)
+        assert chk["status"] == "FAIL"
+        assert "Namunaviy yozuv normasi 1±1e-3 oralig'ida emas" in chk.get("error", "")
+
+
+def test_g4_renormalize_rejects_out_inside_src(tmp_path):
+    """G4: run_renormalize raises ValueError when out_dir is inside src_dir, without creating any new files."""
+    src_dir = tmp_path / "src_db"
+    _create_mock_v2_with_embeddings(src_dir, [[1.0, 2.0, 3.0, 4.0]], normalization=False)
+    before_files = set(src_dir.rglob("*"))
+
+    out_dir = src_dir / "normalized"
+    with pytest.raises(ValueError, match="Chiqish yo'li manba papkasi ichida"):
+        run_renormalize(src_dir, out_dir)
+
+    after_files = set(src_dir.rglob("*"))
+    assert before_files == after_files
+    assert not out_dir.exists()
+
+
+def test_g4_renormalize_rejects_src_inside_out(tmp_path):
+    """G4: run_renormalize raises ValueError when src_dir is inside out_dir, without creating any new files."""
+    out_dir = tmp_path / "parent_out"
+    src_dir = out_dir / "child_src"
+    _create_mock_v2_with_embeddings(src_dir, [[1.0, 2.0, 3.0, 4.0]], normalization=False)
+    before_files = set(src_dir.rglob("*"))
+
+    with pytest.raises(ValueError, match="Manba papkasi chiqish yo'li ichida"):
+        run_renormalize(src_dir, out_dir)
+
+    after_files = set(src_dir.rglob("*"))
+    assert before_files == after_files
+
+
+def test_g5_renormalize_without_ollama_call(tmp_path, monkeypatch):
+    """G5 / TOPILMA 2: run_renormalize completes without calling Ollama (HTTP calls blocked in parent and subprocess), and builds keyword index."""
+    src_dir = tmp_path / "src_no_ollama"
+    out_dir = tmp_path / "out_no_ollama"
+    _create_mock_v2_with_embeddings(src_dir, [[3.0, 4.0, 0.0, 0.0]], normalization=False)
+
+    blocker_dir = tmp_path / "block_ollama"
+    blocker_dir.mkdir(parents=True, exist_ok=True)
+    sitecustomize_code = (
+        "import os\n"
+        "if os.environ.get('GRAPHIFY_BLOCK_OLLAMA_HTTP') == '1':\n"
+        "    def _fail_http(*args, **kwargs):\n"
+        "        raise AssertionError('Ollama HTTP was called in subprocess!')\n"
+        "    try:\n"
+        "        import urllib.request\n"
+        "        urllib.request.urlopen = _fail_http\n"
+        "    except ImportError:\n"
+        "        pass\n"
+        "    try:\n"
+        "        import requests\n"
+        "        requests.post = _fail_http\n"
+        "        requests.get = _fail_http\n"
+        "        requests.request = _fail_http\n"
+        "    except ImportError:\n"
+        "        pass\n"
+    )
+    (blocker_dir / "sitecustomize.py").write_text(sitecustomize_code, encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", f"{blocker_dir}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    monkeypatch.setenv("GRAPHIFY_BLOCK_OLLAMA_HTTP", "1")
+
+    def fail_ollama(*args, **kwargs):
+        raise AssertionError("Ollama HTTP was called during renormalize!")
+
+    with patch("requests.post", side_effect=fail_ollama), \
+         patch("requests.request", side_effect=fail_ollama), \
+         patch("urllib.request.urlopen", side_effect=fail_ollama):
+        # Notice: rebuild_keyword_index_subprocess is NOT mocked!
+        run_renormalize(src_dir, out_dir, batch_size=2)
+
+    # Output collection and keyword index exist and are valid
+    client = chromadb.PersistentClient(path=str(out_dir))
+    col = client.get_collection("graphify")
+    assert col.count() == 1
+    assert (out_dir / "keyword_index.sqlite3").exists()
+    assert (out_dir / "build_complete.json").exists()
+    if hasattr(client, "close"):
+        client.close()
+
+
+def test_g5_subprocess_http_blocking_fails_when_embedder_called(tmp_path, monkeypatch):
+    """G5 / TOPILMA 2: verifies that subprocess HTTP blocking actively catches Ollama HTTP calls and fails the process."""
+    src_dir = tmp_path / "src_fail_db"
+    _create_mock_v2_with_embeddings(src_dir, [[3.0, 4.0, 0.0, 0.0]], normalization=False)
+
+    blocker_dir = tmp_path / "block_ollama_verify"
+    blocker_dir.mkdir(parents=True, exist_ok=True)
+    sitecustomize_code = (
+        "import os\n"
+        "if os.environ.get('GRAPHIFY_BLOCK_OLLAMA_HTTP') == '1':\n"
+        "    def _fail_http(*args, **kwargs):\n"
+        "        raise AssertionError('Ollama HTTP was called in subprocess!')\n"
+        "    try:\n"
+        "        import urllib.request\n"
+        "        urllib.request.urlopen = _fail_http\n"
+        "    except ImportError:\n"
+        "        pass\n"
+        "    try:\n"
+        "        import requests\n"
+        "        requests.post = _fail_http\n"
+        "        requests.get = _fail_http\n"
+        "        requests.request = _fail_http\n"
+        "    except ImportError:\n"
+        "        pass\n"
+    )
+    (blocker_dir / "sitecustomize.py").write_text(sitecustomize_code, encoding="utf-8")
+
+    env = dict(os.environ)
+    env["GRAPHIFY_BLOCK_OLLAMA_HTTP"] = "1"
+    env["GRAPHIFY_DB_PATH"] = str(src_dir.resolve())
+    env["PYTHONPATH"] = f"{blocker_dir}{os.pathsep}{PROJECT_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
+
+    cmd = [
+        sys.executable,
+        "-c",
+        "import sys; import keyword_index; keyword_index.rebuild(no_embedder=False)",
+    ]
+    res = subprocess.run(cmd, env=env, cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=600)
+    assert res.returncode != 0
+    assert "Ollama HTTP was called in subprocess!" in res.stderr
+
+
+def test_g6_renormalize_preserves_4d_fake_source_identity(tmp_path):
+    """G6: run_renormalize preserves 4-d fake source model identity (model name, dimension, backend, digest)."""
+    src_dir = tmp_path / "src_4d"
+    out_dir = tmp_path / "out_4d"
+
+    client = chromadb.PersistentClient(path=str(src_dir))
+    meta = {
+        "schema_version": 2,
+        "backend": "fake_backend",
+        "model": "fake-custom-4d",
+        "model_digest": "sha256:fake_digest_4d",
+        "dimension": 4,
+        "distance": "l2",
+        "normalization": False,
+        "hnsw:space": "l2",
+    }
+    col = client.create_collection("graphify", metadata=meta)
+    col.add(ids=["doc_1"], documents=["Doc one"], metadatas=[{"title": "T1", "project": "p"}], embeddings=[[1.0, 2.0, 3.0, 4.0]])
+
+    manifest = dict(meta)
+    del manifest["hnsw:space"]
+    manifest["total_records"] = 1
+    manifest["corpus_hash"] = "fake_hash_1"
+    (src_dir / "graphify_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if hasattr(client, "close"):
+        client.close()
+
+    run_renormalize(src_dir, out_dir, batch_size=2)
+
+    # 1. Check graphify_manifest.json
+    out_manifest = json.loads((out_dir / "graphify_manifest.json").read_text(encoding="utf-8"))
+    assert out_manifest["dimension"] == 4
+    assert out_manifest["model"] == "fake-custom-4d"
+    assert out_manifest["backend"] == "fake_backend"
+    assert out_manifest["model_digest"] == "sha256:fake_digest_4d"
+    assert out_manifest["normalization"] is True
+    assert out_manifest["distance"] == "cosine"
+
+    # 2. Check build_complete.json
+    out_complete = json.loads((out_dir / "build_complete.json").read_text(encoding="utf-8"))
+    assert out_complete["dimension"] == 4
+    assert out_complete["model"] == "fake-custom-4d"
+    assert out_complete["backend"] == "fake_backend"
+    assert out_complete["normalization"] is True
+    assert "timestamps" in out_complete
+
+    # 3. Check collection metadata in Chroma
+    c = chromadb.PersistentClient(path=str(out_dir))
+    c_col = c.get_collection("graphify")
+    assert c_col.metadata["dimension"] == 4
+    assert c_col.metadata["model"] == "fake-custom-4d"
+    assert c_col.metadata["normalization"] is True
+    if hasattr(c, "close"):
+        c.close()
+
+
+def test_g6_renormalize_with_prefixed_source_identity_updates_prefixed_fields_without_conflict(tmp_path):
+    """TOPILMA 1: run_renormalize updates graphify: prefixed fields in harmony with plain fields, preventing conflict."""
+    src_dir = tmp_path / "src_prefixed"
+    out_dir = tmp_path / "out_prefixed"
+
+    client = chromadb.PersistentClient(path=str(src_dir))
+    meta = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "model_digest": "sha256:fake_digest_4d",
+        "dimension": 4,
+        "distance": "l2",
+        "normalization": False,
+        "graphify:schema_version": 2,
+        "graphify:backend": "ollama",
+        "graphify:model": "bge-m3",
+        "graphify:model_digest": "sha256:fake_digest_4d",
+        "graphify:dimension": 4,
+        "graphify:distance": "l2",
+        "graphify:normalization": False,
+        "hnsw:space": "l2",
+    }
+    col = client.create_collection("graphify", metadata=meta)
+    col.add(ids=["doc_1"], documents=["Doc one"], metadatas=[{"title": "T1", "project": "p"}], embeddings=[[1.0, 2.0, 3.0, 4.0]])
+
+    manifest = dict(meta)
+    del manifest["hnsw:space"]
+    manifest["total_records"] = 1
+    manifest["corpus_hash"] = "fake_hash_pref"
+    (src_dir / "graphify_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if hasattr(client, "close"):
+        client.close()
+
+    run_renormalize(src_dir, out_dir, batch_size=2)
+
+    out_manifest = json.loads((out_dir / "graphify_manifest.json").read_text(encoding="utf-8"))
+    assert out_manifest["distance"] == "cosine"
+    assert out_manifest["graphify:distance"] == "cosine"
+    assert out_manifest["normalization"] is True
+    assert out_manifest["graphify:normalization"] is True
+    assert out_manifest["dimension"] == 4
+    assert out_manifest["graphify:dimension"] == 4
+
+    out_complete = json.loads((out_dir / "build_complete.json").read_text(encoding="utf-8"))
+    assert out_complete["distance"] == "cosine"
+    assert out_complete["graphify:distance"] == "cosine"
+    assert out_complete["normalization"] is True
+    assert out_complete["graphify:normalization"] is True
+
+    # Validate with check_v2_identity (must PASS without conflict)
+    mock_emb = Mock()
+    mock_emb.encode.return_value = np.ones((1, 4), dtype=np.float32)
+    with patch("embedders.build_identity_embedder", return_value=mock_emb):
+        chk = check_v2_identity(out_dir)
+        assert chk["status"] == "PASS", f"check_v2_identity failed: {chk}"
+
+

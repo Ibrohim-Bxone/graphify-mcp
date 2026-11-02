@@ -535,18 +535,26 @@ def validate_destination_persisted_identity(
         _check_identity_conflict(manifest_meta, "manifest", col_meta, "kolleksiya")
 
 
-def rebuild_keyword_index_subprocess(out_dir: Path, timeout: float = None) -> None:
+def rebuild_keyword_index_subprocess(out_dir: Path, timeout: float = None, no_embedder: bool = True) -> None:
     """Run keyword_index.rebuild() in an isolated subprocess with GRAPHIFY_DB_PATH set to out_dir."""
     if timeout is None:
         timeout = float(os.environ.get("GRAPHIFY_KEYWORD_REBUILD_TIMEOUT", 1800.0))
     env = dict(os.environ)
     env["GRAPHIFY_DB_PATH"] = str(out_dir.resolve())
     env["GRAPHIFY_STORAGE_MODE"] = "local"
-    cmd = [
-        sys.executable,
-        "-c",
-        "import sys; sys.path.insert(0, '.'); import keyword_index; keyword_index.rebuild()",
-    ]
+    if no_embedder:
+        env["GRAPHIFY_KEYWORD_NO_EMBEDDER"] = "1"
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, '.'); import keyword_index; keyword_index.rebuild(no_embedder=True)",
+        ]
+    else:
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, '.'); import keyword_index; keyword_index.rebuild()",
+        ]
     print(f"[keyword_index] Qayta qurish boshlandi: GRAPHIFY_DB_PATH={out_dir}...", flush=True)
     try:
         res = subprocess.run(cmd, env=env, cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=timeout)
@@ -663,6 +671,11 @@ def write_manifest_and_identity(
     corpus_hash: str,
     kw_gen: str,
     normalization: bool = False,
+    base_identity: dict | None = None,
+    backend: str | None = None,
+    model: str | None = None,
+    dimension: int | None = None,
+    schema_version: int | None = None,
 ) -> dict:
     """Write manifest.jsonl and graphify_manifest.json with complete model identity."""
     manifest_path = out_dir / "manifest.jsonl"
@@ -676,19 +689,50 @@ def write_manifest_and_identity(
             }
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-    identity = {
-        "schema_version": 2,
-        "backend": "ollama",
-        "model": "bge-m3",
-        "model_digest": model_digest,
-        "dimension": EXPECTED_DIMENSION,
-        "distance": distance,
-        "normalization": bool(normalization),
-        "corpus_hash": corpus_hash,
-        "keyword_index_generation": kw_gen,
-        "total_records": len(records),
-        "v1_sqlite_mtime": v1_mtime,
-    }
+    if base_identity:
+        identity = dict(base_identity)
+    else:
+        identity = {
+            "schema_version": schema_version if schema_version is not None else 2,
+            "backend": backend or "ollama",
+            "model": model or "bge-m3",
+            "model_digest": model_digest,
+            "dimension": dimension if dimension is not None else EXPECTED_DIMENSION,
+        }
+    if schema_version is not None:
+        identity["schema_version"] = schema_version
+    if backend is not None:
+        identity["backend"] = backend
+    if model is not None:
+        identity["model"] = model
+    if dimension is not None:
+        identity["dimension"] = dimension
+    if model_digest is not None:
+        identity["model_digest"] = model_digest
+
+    identity["distance"] = distance
+    identity["normalization"] = bool(normalization)
+    identity["corpus_hash"] = corpus_hash
+    identity["keyword_index_generation"] = kw_gen
+    identity["total_records"] = len(records)
+    identity["v1_sqlite_mtime"] = v1_mtime
+
+    for k in [
+        "schema_version",
+        "backend",
+        "model",
+        "model_digest",
+        "dimension",
+        "distance",
+        "normalization",
+        "corpus_hash",
+        "keyword_index_generation",
+        "total_records",
+        "v1_sqlite_mtime",
+    ]:
+        if f"graphify:{k}" in identity and k in identity:
+            identity[f"graphify:{k}"] = identity[k]
+
     with open(out_dir / "graphify_manifest.json", "w", encoding="utf-8") as f:
         json.dump(identity, f, indent=2, ensure_ascii=False)
 
@@ -1076,8 +1120,16 @@ def run_renormalize(src_dir: Path, out_dir: Path, batch_size: int = 500) -> None
     if not (src_dir / "chroma.sqlite3").exists():
         raise FileNotFoundError(f"Manba v2 SQLite fayli topilmadi: {src_dir / 'chroma.sqlite3'}")
 
-    if out_dir.resolve() == src_dir.resolve():
+    src_res = src_dir.resolve()
+    out_res = out_dir.resolve()
+
+    if out_res == src_res:
         raise ValueError(f"Chiqish yo'li manba bilan bir xil bo'lishi mumkin emas: {out_dir}")
+    if out_res.is_relative_to(src_res):
+        raise ValueError(f"Chiqish yo'li manba papkasi ichida bo'lishi mumkin emas: {out_dir}")
+    if src_res.is_relative_to(out_res):
+        raise ValueError(f"Manba papkasi chiqish yo'li ichida bo'lishi mumkin emas: {out_dir}")
+
     if out_dir.exists():
         try:
             if any(out_dir.iterdir()):
@@ -1123,16 +1175,25 @@ def run_renormalize(src_dir: Path, out_dir: Path, batch_size: int = 500) -> None
             raise RuntimeError(f"Manba kolleksiyasida yozuvlar topilmadi: {src_dir}")
 
         # Prepare destination collection
+        backend_val = src_identity.get("backend") if src_identity.get("backend") is not None else src_identity.get("graphify:backend", "ollama")
+        model_val = src_identity.get("model") if src_identity.get("model") is not None else src_identity.get("graphify:model", "bge-m3")
+        digest_val = src_identity.get("model_digest") if src_identity.get("model_digest") is not None else src_identity.get("graphify:model_digest", "")
+        dim_val = src_identity.get("dimension") if src_identity.get("dimension") is not None else src_identity.get("graphify:dimension", EXPECTED_DIMENSION)
+        schema_val = src_identity.get("schema_version") if src_identity.get("schema_version") is not None else src_identity.get("graphify:schema_version", 2)
+
         out_identity = dict(src_identity)
         out_identity.update({
-            "backend": src_identity.get("backend", "ollama"),
-            "model": src_identity.get("model", "bge-m3"),
-            "model_digest": src_identity.get("model_digest", ""),
-            "dimension": int(src_identity.get("dimension", EXPECTED_DIMENSION)),
-            "schema_version": int(src_identity.get("schema_version", 2)),
+            "backend": backend_val,
+            "model": model_val,
+            "model_digest": digest_val,
+            "dimension": int(dim_val),
+            "schema_version": int(schema_val),
             "distance": "cosine",
             "normalization": True,
         })
+        for k in ["backend", "model", "model_digest", "dimension", "schema_version", "distance", "normalization"]:
+            if f"graphify:{k}" in out_identity and k in out_identity:
+                out_identity[f"graphify:{k}"] = out_identity[k]
 
         out_client = chromadb.PersistentClient(path=str(out_dir))
         out_meta = {k: v for k, v in out_identity.items() if not k.startswith("hnsw:")}
@@ -1222,7 +1283,7 @@ def run_renormalize(src_dir: Path, out_dir: Path, batch_size: int = 500) -> None
         # Align chroma collection configuration so embedding_function is legacy
         _align_chroma_collection_configuration(out_dir, "graphify")
 
-        # 3. Subprocess rebuild keyword index
+        # 3. Subprocess rebuild keyword index without embedder
         rebuild_keyword_index_subprocess(out_dir)
 
         # 4. Verify all records and keyword index content
@@ -1234,16 +1295,27 @@ def run_renormalize(src_dir: Path, out_dir: Path, batch_size: int = 500) -> None
         corpus_hash = compute_corpus_hash(all_records)
         v1_mtime = src_identity.get("v1_sqlite_mtime", 0.0)
 
+        digest_val = src_identity.get("model_digest") if src_identity.get("model_digest") is not None else src_identity.get("graphify:model_digest", out_identity.get("model_digest", ""))
+        backend_val = src_identity.get("backend") if src_identity.get("backend") is not None else src_identity.get("graphify:backend", "ollama")
+        model_val = src_identity.get("model") if src_identity.get("model") is not None else src_identity.get("graphify:model", "bge-m3")
+        dim_val = int(src_identity["dimension"]) if "dimension" in src_identity else (int(src_identity["graphify:dimension"]) if "graphify:dimension" in src_identity else None)
+        schema_val = int(src_identity["schema_version"]) if "schema_version" in src_identity else (int(src_identity["graphify:schema_version"]) if "graphify:schema_version" in src_identity else 2)
+
         final_identity = write_manifest_and_identity(
             out_dir=out_dir,
             records=all_records,
             v1_mtime=v1_mtime,
             started_at=started_at,
-            model_digest=out_identity.get("model_digest", ""),
+            model_digest=digest_val,
             distance="cosine",
             corpus_hash=corpus_hash,
             kw_gen=kw_gen,
             normalization=True,
+            base_identity=src_identity,
+            backend=backend_val,
+            model=model_val,
+            dimension=dim_val,
+            schema_version=schema_val,
         )
         col_modify_meta = {k: v for k, v in final_identity.items() if not k.startswith("hnsw:")}
         out_col.modify(metadata=col_modify_meta)
@@ -1290,9 +1362,15 @@ def main():
     else:
         out_dir = Path("kg_db_v2")
 
-    # Finding 1: reject --out that resolves to source
-    if out_dir.resolve() == v1_dir.resolve():
+    # Finding 1 / G4: reject --out that resolves to source or overlaps
+    v1_res = v1_dir.resolve()
+    out_res = out_dir.resolve()
+    if out_res == v1_res:
         raise ValueError(f"Chiqish yo'li v1 manbasi bilan bir xil bo'lishi mumkin emas: out={out_dir}, v1={v1_dir}")
+    if out_res.is_relative_to(v1_res):
+        raise ValueError(f"Chiqish yo'li v1 manbasi ichida bo'lishi mumkin emas: out={out_dir}, v1={v1_dir}")
+    if v1_res.is_relative_to(out_res):
+        raise ValueError(f"v1 manbasi chiqish yo'li ichida bo'lishi mumkin emas: out={out_dir}, v1={v1_dir}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
 

@@ -10,6 +10,7 @@ import sys
 from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
+import chromadb
 import numpy as np
 import pytest
 
@@ -20,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from migrate_v2.switch_check import (
     check_v2_completeness,
     check_v2_identity,
+    check_v2_normalization,
     find_running_graphify_processes,
     print_checklist,
 )
@@ -106,7 +108,7 @@ def test_check_v2_identity_requires_db_and_detects_conflict_with_manifest(tmp_pa
         assert res_ok["model"] == "bge-m3"
 
 
-def test_print_checklist_prints_pid_and_executable_only_without_token(monkeypatch):
+def test_print_checklist_prints_pid_and_executable_only_without_token(monkeypatch, tmp_path):
     """Finding 9: switch_check prints PID and executable name only; never full command lines or secret tokens."""
     processes = [
         {
@@ -137,8 +139,8 @@ def test_print_checklist_prints_pid_and_executable_only_without_token(monkeypatc
         drift=drift,
         identity=identity,
         launch_configs=launch_configs,
-        v1_dir=Path("kg_db"),
-        v2_dir=Path("kg_db_v2"),
+        v1_dir=tmp_path / "kg_db",
+        v2_dir=tmp_path / "kg_db_v2",
     )
 
     output = captured.getvalue()
@@ -150,6 +152,45 @@ def test_print_checklist_prints_pid_and_executable_only_without_token(monkeypatc
     assert "SECRET_HTTP_TOKEN" not in output
     assert "--token" not in output
     assert "--api-key" not in output
+
+
+def test_print_checklist_isolation_from_cwd(monkeypatch, tmp_path):
+    """G7 / TOPILMA 3: print_checklist with tmp_path never opens or creates kg_db/kg_db_v2 in working directory."""
+    isolated_cwd = tmp_path / "isolated_cwd"
+    isolated_cwd.mkdir()
+    monkeypatch.chdir(isolated_cwd)
+
+    cwd_kg_db = isolated_cwd / "kg_db"
+    cwd_kg_db_v2 = isolated_cwd / "kg_db_v2"
+    assert not cwd_kg_db.exists()
+    assert not cwd_kg_db_v2.exists()
+
+    opened_db_paths = []
+    real_persistent_client = chromadb.PersistentClient
+
+    def tracking_persistent_client(path=None, *args, **kwargs):
+        if path is not None:
+            opened_db_paths.append(str(Path(path).resolve()))
+        return real_persistent_client(path=path, *args, **kwargs)
+
+    captured = StringIO()
+    monkeypatch.setattr(sys, "stdout", captured)
+
+    with patch("chromadb.PersistentClient", side_effect=tracking_persistent_client):
+        print_checklist(
+            processes=[],
+            drift={"status": "OK", "total_drift": 0, "total_v1": 0},
+            identity={"status": "PASS", "model": "bge-m3", "backend": "ollama", "dimension": 1024, "digest": "sha256:abc"},
+            launch_configs=[],
+            v1_dir=tmp_path / "iso_v1",
+            v2_dir=tmp_path / "iso_v2",
+        )
+
+    assert not cwd_kg_db.exists()
+    assert not cwd_kg_db_v2.exists()
+    for p in opened_db_paths:
+        assert str(isolated_cwd) not in p or p.startswith(str(tmp_path.resolve()))
+
 
 def test_check_v2_identity_fails_when_graphify_collection_missing(tmp_path):
     """Finding 8 regression (TOPILMA 4): When DB has collections but lacks 'graphify', check_v2_identity must FAIL."""
@@ -1099,6 +1140,88 @@ def test_check_v2_completeness_prefixed_keys_ollama_with_digest_passes(tmp_path)
         res = check_v2_completeness(v2_dir)
         assert res["status"] == "PASS"
         assert res["count"] == 2
+
+
+def test_g1_switch_check_normalization_sample_nan_fails(tmp_path):
+    """G1: check_v2_normalization returns FAIL when vector sample contains [nan, 0]."""
+    v2_dir = tmp_path / "v2_nan_check"
+    v2_dir.mkdir()
+    (v2_dir / "chroma.sqlite3").write_text("", encoding="utf-8")
+    manifest_data = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "dimension": 2,
+        "distance": "cosine",
+        "normalization": True,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    mock_col = Mock()
+    mock_col.count.return_value = 1
+    mock_col.get.return_value = {"embeddings": [[float("nan"), 0.0]]}
+    mock_client = Mock()
+    mock_client.get_collection.return_value = mock_col
+
+    with patch("chromadb.PersistentClient", return_value=mock_client):
+        res = check_v2_normalization(v2_dir)
+        assert res["status"] == "FAIL"
+        assert "Namunaviy yozuv normasi 1±1e-3 oralig'ida emas" in res.get("error", "")
+
+
+def test_g1_switch_check_normalization_sample_inf_fails(tmp_path):
+    """G1: check_v2_normalization returns FAIL when vector sample contains [inf, 0]."""
+    v2_dir = tmp_path / "v2_inf_check"
+    v2_dir.mkdir()
+    (v2_dir / "chroma.sqlite3").write_text("", encoding="utf-8")
+    manifest_data = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "dimension": 2,
+        "distance": "cosine",
+        "normalization": True,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    mock_col = Mock()
+    mock_col.count.return_value = 1
+    mock_col.get.return_value = {"embeddings": [[float("inf"), 0.0]]}
+    mock_client = Mock()
+    mock_client.get_collection.return_value = mock_col
+
+    with patch("chromadb.PersistentClient", return_value=mock_client):
+        res = check_v2_normalization(v2_dir)
+        assert res["status"] == "FAIL"
+        assert "Namunaviy yozuv normasi 1±1e-3 oralig'ida emas" in res.get("error", "")
+
+
+def test_g1_switch_check_normalization_sample_unit_passes(tmp_path):
+    """G1: check_v2_normalization returns PASS when vector sample has unit norm."""
+    v2_dir = tmp_path / "v2_unit_check"
+    v2_dir.mkdir()
+    (v2_dir / "chroma.sqlite3").write_text("", encoding="utf-8")
+    manifest_data = {
+        "schema_version": 2,
+        "backend": "ollama",
+        "model": "bge-m3",
+        "dimension": 2,
+        "distance": "cosine",
+        "normalization": True,
+    }
+    (v2_dir / "graphify_manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    mock_col = Mock()
+    mock_col.count.return_value = 1
+    mock_col.get.return_value = {"embeddings": [[1.0, 0.0]]}
+    mock_client = Mock()
+    mock_client.get_collection.return_value = mock_col
+
+    with patch("chromadb.PersistentClient", return_value=mock_client):
+        res = check_v2_normalization(v2_dir)
+        assert res["status"] == "PASS"
+        assert res["sample_count"] == 1
+
 
 
 

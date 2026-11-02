@@ -698,7 +698,7 @@ def check_v2_normalization(v2_dir: Path) -> dict:
                         return {"status": "FAIL", "error": f"Yozuv {idx} da embedding yo'q"}
                     v = np.array(vec, dtype=np.float32)
                     norm = float(np.linalg.norm(v))
-                    if abs(norm - 1.0) > 1e-3:
+                    if not np.isfinite(norm) or not np.all(np.isfinite(v)) or abs(norm - 1.0) > 1e-3:
                         return {
                             "status": "FAIL",
                             "error": f"Namunaviy yozuv normasi 1±1e-3 oralig'ida emas: norm={norm:.6f} (kutilgan=1.0)",

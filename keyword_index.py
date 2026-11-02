@@ -292,15 +292,33 @@ def get_index():
         _index_singleton = KeywordIndex()
     return _index_singleton
 
-def rebuild():
+def rebuild(no_embedder: bool = False):
     print("OGOHLANTIRISH: Barcha servislarni to'xtatganingizga ishonch hosil qiling!")
     import sys
     sys.path.append(str(Path(__file__).parent))
     import yozuv
     with yozuv.lock():
         print("Kalit so'z indeksini qayta qurish (bu biroz vaqt olishi mumkin)...")
-        from db import get_collection
-        col = get_collection()
+        if no_embedder or os.environ.get("GRAPHIFY_KEYWORD_NO_EMBEDDER") == "1":
+            import chromadb
+            db_dir = Path(os.environ.get("GRAPHIFY_DB_PATH", str(Path(__file__).parent / "kg_db")))
+            client = chromadb.PersistentClient(path=str(db_dir))
+            try:
+                col = client.get_collection("graphify")
+                data = col.get(include=["documents", "metadatas"])
+            finally:
+                try:
+                    if hasattr(client, "close") and callable(client.close):
+                        client.close()
+                    elif hasattr(client, "_system") and hasattr(client._system, "stop"):
+                        client._system.stop()
+                except Exception as err:
+                    print(f"[keyword_index] Chroma klientini yopib bo'lmadi: {err}", file=sys.stderr)
+            del client
+        else:
+            from db import get_collection
+            col = get_collection()
+            data = col.get(include=["documents", "metadatas"])
         
         idx = KeywordIndex()
         with idx.conn:
@@ -310,7 +328,6 @@ def rebuild():
         idx._init_db()
         
         # Process in batches
-        data = col.get(include=["documents", "metadatas"])
         ids = data["ids"]
         docs = data["documents"]
         metas = data["metadatas"]
@@ -328,8 +345,9 @@ def rebuild():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--qayta-qur", action="store_true")
+    parser.add_argument("--no-embedder", action="store_true")
     args = parser.parse_args()
     if args.qayta_qur:
-        rebuild()
+        rebuild(no_embedder=args.no_embedder)
     else:
         parser.print_help()
