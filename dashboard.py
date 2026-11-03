@@ -67,15 +67,75 @@ def get_projects(memories):
 
 def load_token_stats():
     """Read the running token-savings counters written by server.py (ESTIMATE only)."""
+    import sys
+    import time
     try:
-        with open(STATS_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except (OSError, ValueError):
+        lock_file = STATS_PATH + ".lock"
+        f_lock = open(lock_file, "w")
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                start = time.monotonic()
+                while True:
+                    try:
+                        msvcrt.locking(f_lock.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() - start > 10:
+                            raise RuntimeError("token_stats qulflanib qoldi")
+                        time.sleep(0.05)
+            else:
+                import fcntl
+                start = time.monotonic()
+                while True:
+                    try:
+                        fcntl.flock(f_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        if time.monotonic() - start > 10:
+                            raise RuntimeError("token_stats qulflanib qoldi")
+                        time.sleep(0.05)
+            
+            with open(STATS_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        finally:
+            if sys.platform == "win32":
+                import msvcrt
+                try:
+                    msvcrt.locking(f_lock.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                import fcntl
+                try:
+                    fcntl.flock(f_lock.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            f_lock.close()
+    except (OSError, ValueError, RuntimeError):
         data = {}
     would = int(data.get('would_have_tokens', 0))
     actual = int(data.get('actual_tokens', 0))
     pct = round((1 - actual / would) * 100) if would > 0 else None
     return {'would': would, 'actual': actual, 'pct': pct}
+
+
+@app.before_request
+def check_origin():
+    if request.method == "POST":
+        origin = request.headers.get("Origin") or request.headers.get("Referer")
+        if not origin:
+            from flask import abort
+            abort(403)
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(origin)
+            if parsed.hostname not in ("localhost", "127.0.0.1"):
+                from flask import abort
+                abort(403)
+        except Exception:
+            from flask import abort
+            abort(403)
 
 
 @app.route('/')
@@ -172,7 +232,7 @@ def index():
             )
         elif key == 'ollama':
             fields_html = (
-                f'<input type="text" name="ollama_base_url" placeholder="http://localhost:11434" value="{esc(sub.get("base_url", "http://localhost:11434"))}">'
+                f'<input type="text" name="ollama_base_url" placeholder="http://127.0.0.1:11434" value="{esc(sub.get("base_url", "http://127.0.0.1:11434"))}">'
                 f'<input type="text" name="ollama_model" placeholder="model (masalan nomic-embed-text)" value="{esc(sub.get("model", "nomic-embed-text"))}">'
             )
         elif key == 'custom':
@@ -760,7 +820,8 @@ def delete_memory():
     """Xotirani bazadan o'chiradi (db.col orqali)."""
     mem_id = request.form.get('id')
     if mem_id:
-        col.delete(ids=[mem_id])
+        import yozuv
+        yozuv.delete(col, ids=[mem_id])
     return redirect('/')
 
 
@@ -783,5 +844,5 @@ def save_models():
 
 
 if __name__ == '__main__':
-    print("Dashboard: http://localhost:5000")
-    app.run(debug=False, port=5000)
+    print("Dashboard: http://127.0.0.1:5000")
+    app.run(host='127.0.0.1', debug=False, port=5000)

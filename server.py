@@ -28,6 +28,7 @@ from db import (
     reopen as db_reopen,
     db_retry,
     _open_collection as db_open_collection,
+    flush_index,
 )
 # Running cumulative token-savings ESTIMATE (see search_knowledge/save_memory
 # below). Kept as a small JSON file next to kg_db/ rather than in Chroma's
@@ -35,7 +36,11 @@ from db import (
 STATS_PATH = str(Path(__file__).parent / "token_stats.json")
 # Hard floor for search results. The FastMCP instructions below quote this same
 # constant, so the tool description can never drift from what the code does.
-MIN_SIMILARITY = 0.15
+# 2026-09-05: O'lchovlar ko'rsatdiki, bu embedding modelida cosine kattaligi
+# mos va mos bo'lmagan natijani ajratmaydi (aloqasiz so'rov 0.50, haqiqiy moslik 0.31).
+# Shuning uchun MIN_SIMILARITY faqatgina butunlay bog'liqsiz axlatni filtrlash uchun 0.10 qilib
+# belgilandi. Haqiqiy ajratish gibrid qidiruv (kalit so'z + RRF + manba bo'yicha guruhlash) orqali keladi.
+MIN_SIMILARITY = float(os.environ.get("GRAPHIFY_MIN_SIMILARITY", "0.10"))
 # Claude Code starts the MCP server in the session's working directory,
 # so the folder name identifies which project a memory belongs to.
 PROJECT = Path(os.getcwd()).name or "unknown"
@@ -53,7 +58,7 @@ mcp = FastMCP(
         "prior decisions, prompts and session summaries instead of asking the user or "
         "re-reading many files. At the END of a substantial session, call save_memory "
         "with a short summary of what was done and decided. "
-        f"Ignore results with similarity below {MIN_SIMILARITY}. By DEFAULT search is scoped to "
+        f"Ignore results with similarity below {MIN_SIMILARITY}. Note: this threshold does NOT guarantee relevance; measurements show that for this embedding model, cosine magnitude does not separate relevant and irrelevant results (irrelevant query can score 0.50, true match 0.31). Real separation already comes from hybrid search (vector + keyword + RRF + source grouping), which runs on every search_knowledge call. Entries found only via keyword match (similarity: 0.00) are NOT filtered by this threshold — it applies to vector-search candidates only, so do not discard a sim=0.00 result on that basis alone. Each candidate must additionally pass a lexical-coverage check (at least half of the query's IDF-weighted words must appear verbatim in the text), so a status:\"insufficient_evidence\" reply does not mean the information doesn't exist — it often means the query's wording differs from the source; try rephrasing the query closer to the document's own words. By DEFAULT search is scoped to "
         "the CURRENT project PLUS the always-open projects (" + ", ".join(ALWAYS_OPEN) + "): "
         "other projects' private memories never leak in, but the shared knowledge base "
         "is reachable from everywhere. Pass project='all' to search every project, or an "
@@ -69,31 +74,104 @@ def _est_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+import contextlib
+import time
+
+@contextlib.contextmanager
+def _stats_lock():
+    lock_file = STATS_PATH + ".lock"
+    f = open(lock_file, "w")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            start = time.monotonic()
+            while True:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() - start > 10:
+                        raise RuntimeError("token_stats qulflanib qoldi")
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            start = time.monotonic()
+            while True:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() - start > 10:
+                        raise RuntimeError("token_stats qulflanib qoldi")
+                    time.sleep(0.05)
+        yield
+    finally:
+        if sys.platform == "win32":
+            import msvcrt
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        f.close()
+
+
 def _load_token_stats() -> dict:
     try:
-        with open(STATS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return {
-            "would_have_tokens": int(data.get("would_have_tokens", 0)),
-            "actual_tokens": int(data.get("actual_tokens", 0)),
-        }
-    except (OSError, ValueError):
+        with _stats_lock():
+            with open(STATS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {
+                "would_have_tokens": int(data.get("would_have_tokens", 0)),
+                "actual_tokens": int(data.get("actual_tokens", 0)),
+            }
+    except (OSError, ValueError, RuntimeError):
         return {"would_have_tokens": 0, "actual_tokens": 0}
 
 
 def _save_token_stats(stats: dict) -> None:
-    # Atomic replace: the bot and the MCP server can both be running, and a
-    # half-written file was silently resetting the counters to zero on read.
     tmp = f"{STATS_PATH}.{uuid.uuid4().hex}.tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(stats, f)
-        os.replace(tmp, STATS_PATH)
-    except OSError:
+        with _stats_lock():
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(stats, f)
+            os.replace(tmp, STATS_PATH)
+    except (OSError, RuntimeError):
         try:
             os.unlink(tmp)
         except OSError:
             pass
+
+
+import collections
+
+_est_tokens_cache = collections.OrderedDict()
+
+def warm_savings_cache(where) -> None:
+    """Pre-compute the total would_have_tokens for a given query scope."""
+    from db import get_db_mtime
+    import json
+    try:
+        where_json = json.dumps(where, sort_keys=True) if where else ""
+        mtime = get_db_mtime()
+        cache_key = (where_json, mtime)
+        
+        pool = _col.get(where=where, include=["documents", "metadatas"])
+        total = sum(
+            (meta or {}).get("est_tokens") or _est_tokens(doc)
+            for doc, meta in zip(pool.get("documents", []), pool.get("metadatas", []))
+        )
+        
+        _est_tokens_cache[cache_key] = total
+        if len(_est_tokens_cache) > 32:
+            _est_tokens_cache.popitem(last=False)
+    except Exception as err:
+        print(f"[graphify] warm_savings_cache failed: {err}", file=sys.stderr)
 
 
 def _record_search_savings(where, returned_tokens: int) -> None:
@@ -105,17 +183,43 @@ def _record_search_savings(where, returned_tokens: int) -> None:
     actually returned this call. The gap between the two is the savings
     surfaced on the dashboard.
     """
-    pool = _col.get(where=where, include=["documents", "metadatas"])
-    would_have = sum(
-        (meta or {}).get("est_tokens") or _est_tokens(doc)
-        for doc, meta in zip(pool["documents"], pool["metadatas"])
-    )
-    if would_have <= 0:
-        return
-    stats = _load_token_stats()
-    stats["would_have_tokens"] += would_have
-    stats["actual_tokens"] += returned_tokens
-    _save_token_stats(stats)
+    from db import get_db_mtime
+    import json
+
+    where_json = json.dumps(where, sort_keys=True) if where else ""
+    mtime = get_db_mtime()
+    cache_key = (where_json, mtime)
+
+    if cache_key in _est_tokens_cache:
+        would_have = _est_tokens_cache[cache_key]
+        if would_have > 0:
+            try:
+                with _stats_lock():
+                    try:
+                        with open(STATS_PATH, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        stats = {
+                            "would_have_tokens": int(data.get("would_have_tokens", 0)),
+                            "actual_tokens": int(data.get("actual_tokens", 0)),
+                        }
+                    except (OSError, ValueError):
+                        stats = {"would_have_tokens": 0, "actual_tokens": 0}
+                        
+                    stats["would_have_tokens"] += would_have
+                    stats["actual_tokens"] += returned_tokens
+                    
+                    tmp = f"{STATS_PATH}.{uuid.uuid4().hex}.tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(stats, f)
+                    os.replace(tmp, STATS_PATH)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+    else:
+        # Kesh promahida statistika shu chaqiruvda o'tkazib yuboriladi
+        pass
 
 
 def _open_collection():
@@ -143,7 +247,7 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
 
     Args:
         query: what to look for, in natural language (any language).
-        top_k: number of results to return (1-10).
+        top_k: number of results to return (1-30).
         kind: optional filter: "decision", "summary", "note", "prompt" or "doc".
         project: which project to search. Default "current" = this project PLUS the
             always-open projects (ALWAYS_OPEN, default "shared" and "Promtlarim";
@@ -157,8 +261,11 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
     Returns:
         Matched entries formatted with kind, title, project, source, date, author (if available),
         similarity score, and snippet.
+        Note: The similarity score is a measure of relative semantic proximity, NOT a probability of correctness.
     """
-    top_k = max(1, min(int(top_k), 10))
+    # Yuqori chegara 30 ga ko'tarildi (2026-09-04 e'tirozi: 10 ta cheklov 10 dan ortiq mos yozuv bo'lganda natijalarni kesib qo'yardi).
+    # Sukut qiymati 5 bo'lib qoladi (har bir so'rovda ortiqcha token sarflanishining oldini olish uchun).
+    top_k = max(1, min(int(top_k), 30))
     filters = []
     if kind:
         filters.append({"kind": kind})
@@ -173,40 +280,112 @@ def search_knowledge(query: str, top_k: int = 5, kind: str = "", project: str = 
     where = filters[0] if len(filters) == 1 else ({"$and": filters} if filters else None)
     if _col.count() == 0:
         return "Knowledge base is empty. Nothing indexed yet."
-    res = _col.query(
-        query_texts=[query],
-        n_results=min(top_k, _col.count()),
-        where=where,
-        include=["documents", "metadatas", "distances"],
-    )
+    import search_service
+    import keyword_index
+    import search_core
+    kw_idx = keyword_index.get_index()
+
+    captured_degraded = []
+    captured_errors = []
+    total_hybrid_calls = 0
+    orig_hybrid = getattr(search_core, "hybrid_search", None)
+
+    def _tracking_hybrid(*args, **kwargs):
+        nonlocal total_hybrid_calls
+        total_hybrid_calls += 1
+        h_res = orig_hybrid(*args, **kwargs)
+        if isinstance(h_res, dict) and h_res.get("degraded"):
+            captured_degraded.append(h_res["degraded"])
+            if h_res.get("degraded_error"):
+                captured_errors.append(h_res["degraded_error"])
+        return h_res
+
+    try:
+        if orig_hybrid is not None:
+            search_core.hybrid_search = _tracking_hybrid
+        res = search_service.retrieve(
+            query=query,
+            top_k=top_k,
+            where=where,
+            collection=_col,
+            kw_index=kw_idx,
+            min_similarity=MIN_SIMILARITY
+        )
+    finally:
+        if orig_hybrid is not None:
+            search_core.hybrid_search = orig_hybrid
+
+    is_degraded = res.get("degraded") or (captured_degraded[0] if captured_degraded else None)
+    degraded_err = res.get("degraded_error") or (captured_errors[0] if captured_errors else "")
+    
     out = []
+    if res["status"] == "insufficient_evidence":
+        out.append("Bu so'rov uchun yetarli mos dalil topilmadi. Quyidagi nomzodlar dalil emas; kerak bo'lsa sarlavhasi bilan qayta qidiring.")
     returned_tokens = 0
-    for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
-        sim = 1.0 - dist
-        if sim < MIN_SIMILARITY:
-            continue
-        meta = meta or {}
+    for item in res["results"]:
+        meta = item["meta"] or {}
+        doc = item["text"]
+        sim = item.get("similarity", 0.0)
         returned_tokens += _est_tokens(doc)
         author_part = f" | author: {meta.get('author')}" if meta.get("author") else ""
+        
+        boshqa_text = ""
+        boshqa = item.get("boshqa_boshqalar", [])
+        if boshqa:
+            boshqa_lines = []
+            for b in boshqa[:3]:
+                b_meta = b.get("meta", {})
+                # id nomzodning O'ZIDA saqlanadi (b["id"]), meta ichida EMAS —
+                # kalit so'z orqali topilgan nomzodlarning meta'sida "id" maydoni
+                # umuman yo'q (keyword_index faqat project/kind/parent_id
+                # saqlaydi), shuning uchun b_meta.get("id") doim "?" berardi.
+                boshqa_lines.append(f"  - {b.get('id') or b_meta.get('id', '?')}: {b.get('text', '')[:60]}...")
+            if len(boshqa) > 3:
+                boshqa_lines.append(f"  - (... va yana {len(boshqa)-3} ta bo'lak)")
+            boshqa_text = "\nBoshqa bo'laklar:\n" + "\n".join(boshqa_lines)
+            
         out.append(
             f"[{meta.get('kind', 'doc')}] {meta.get('title', '(untitled)')} "
             f"| project: {meta.get('project', '?')} | source: {meta.get('source', '?')} "
             f"| date: {meta.get('date', '?')}{author_part} "
-            f"| similarity: {sim:.2f} | id: {meta.get('id', '?')}\n{doc}"
+            f"| similarity: {sim:.2f} | id: {meta.get('id', '?')}\n{doc}{boshqa_text}"
         )
+        
+    related = res.get("related_candidates", [])
+    if related:
+        rel_lines = ["\n[Qo'shimcha mosliklar (dalil yetarli emas, faqat nomzod)]"]
+        for r in related[:5]:
+            r_meta = r.get("meta", {})
+            r_sim = r.get("similarity", 0.0)
+            rel_lines.append(f"- {r_meta.get('title', '?')} ({r_meta.get('id', '?')}) sim={r_sim:.2f}")
+        if len(related) > 5:
+            rel_lines.append(f"- (... va yana {len(related)-5} ta)")
+        out.append("\n".join(rel_lines))
+        
     try:
-        _record_search_savings(where, returned_tokens)
+        if res["results"]:
+            _record_search_savings(where, returned_tokens)
     except Exception as err:
         print(f"[graphify] Statistika xatosi ({err}), o'tkazib yuborildi.", file=sys.stderr)
-    if not out:
-        return "No relevant results found."
-    return "\n\n---\n\n".join(out)
+    result_text = "\n\n---\n\n".join(out) if out else "No relevant results found."
+    if is_degraded:
+        err_lines = str(degraded_err or "").strip().splitlines()
+        err_short = err_lines[0].strip() if err_lines and err_lines[0].strip() else "vektor indeksi xatosi"
+        if len(err_short) > 120:
+            err_short = err_short[:117] + "..."
+        if total_hybrid_calls > 1 and len(captured_degraded) < total_hybrid_calls:
+            warning_header = f"⚠️ Vektor qidiruvning bir qismi ishlamadi ({err_short})."
+        else:
+            warning_header = f"⚠️ Vektor qidiruv ishlamadi ({err_short}), natija faqat kalit so'z bo'yicha."
+        return f"{warning_header}\n\n{result_text}"
+    return result_text
 
 
 @mcp.tool()
 @_db_retry
 def save_memory(content: str, title: str, kind: str = "note", tags: str = "",
-                 shared: bool = False, author: str = "") -> str:
+                 shared: bool = False, author: str = "",
+                 private: bool = False) -> str:
     """Save a memory (decision, session summary, note or important prompt) to the knowledge base.
 
     Args:
@@ -222,13 +401,25 @@ def save_memory(content: str, title: str, kind: str = "note", tags: str = "",
             it would only surface for someone who already knew to look here.
         author: optional author/contributor identifier. If empty, falls back to the
             GRAPHIFY_AUTHOR environment variable (or empty string if unset).
+        private: pass True to scope this memory to the CURRENT project only
+            (project = the working directory name). Default False saves under the
+            first ALWAYS_OPEN project so every project's default search finds it;
+            the working directory name is still recorded in "origin_project".
     """
     author = str(author or os.environ.get("GRAPHIFY_AUTHOR", "") or "").strip()
     if kind not in ("decision", "summary", "note", "prompt", "doc"):
         kind = "note"
-    project = ALWAYS_OPEN[0] if shared and ALWAYS_OPEN else PROJECT
+    # 2026-09-05: sukut TESKARIGA o'zgartirildi. Avval xotira joriy papka nomi
+    # bilan yozilardi (PROJECT = cwd nomi), shuning uchun boshqa papkadan
+    # qidirilganda TOPILMASDI: 392 xotiradan 328 tasi shu sababdan ko'rinmay
+    # qolgan edi. Endi sukut ALWAYS_OPEN[0] ("shared") - xotira hamma joydan
+    # topiladi. Papka nomi yo'qolmaydi, "origin_project" da saqlanadi.
+    # Faqat bitta papkaga tegishli xotira uchun private=True bering.
+    project = PROJECT if private else (ALWAYS_OPEN[0] if ALWAYS_OPEN else PROJECT)
     mem_id = f"mem_{uuid.uuid4().hex[:12]}"
-    _col.add(
+    import yozuv
+    yozuv.upsert(
+        _col,
         ids=[mem_id],
         documents=[content],
         metadatas=[{
@@ -238,11 +429,16 @@ def save_memory(content: str, title: str, kind: str = "note", tags: str = "",
             "tags": tags,
             "source": "save_memory",
             "project": project,
+            "origin_project": PROJECT,
             "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "author": author,
             "est_tokens": _est_tokens(content),
         }],
     )
+    try:
+        flush_index()
+    except Exception:
+        pass
     return f"Saved as {mem_id} ({kind}: {title}, project: {project})"
 
 
@@ -273,7 +469,8 @@ def delete_memory(memory_id: str) -> str:
     this deletes ONLY that single chunk. To delete an entire Instagram post and all its chunks,
     use delete_by_shortcode(shortcode) instead.
     """
-    _col.delete(ids=[memory_id])
+    import yozuv
+    yozuv.delete(_col, ids=[memory_id])
     return f"Deleted {memory_id}"
 
 
@@ -301,7 +498,8 @@ def delete_by_shortcode(shortcode: str) -> str:
     count = len(ids)
     if count == 0:
         return f"No entries found for shortcode '{shortcode}'."
-    _col.delete(where={"shortcode": shortcode})
+    import yozuv
+    yozuv.delete(_col, ids=ids)
     return (
         f"Deleted {count} entries for shortcode '{shortcode}'. "
         f"Note: Markdown archive file ({shortcode}.md) was not deleted; delete it on the bot side if needed."
